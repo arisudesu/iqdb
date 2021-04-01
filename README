@@ -1,0 +1,116 @@
+iqdb - Image Query Database system
+piespy@gmail.com
+
+Distributed under the terms of the GNU General Public License,
+see the file COPYING for details.
+
+1) Compiling
+
+- install the ImageMagick development package
+- run make
+- if it fails, fix the Makefile or something
+
+2) Running
+
+The iqdb program has to operating modes: database maintenance and query server.
+
+The maintenance mode is to update image databases: add and remove images, set
+image properties and retrieve database stats. The query server mode listens on
+a TCP port for query commands and returns matching image IDs.
+
+a) Maintenance
+
+Two major modes of calling the maintenance mode:
+
+$ iqdb add foo.db
+
+This mode expects a list of image IDs and filenames on stdin, in this format:
+	<ID> [<width> <height>]:<filename>
+
+The ID is the image ID in hexadecimal. If width and height are not specified,
+the values from the filename are used instead. The filename can be any image
+format supported by ImageMagick; the image will be resized to 128x128 and
+added to the database. Duplicate IDs are ignored. Note that iqdb does not
+remember the filename associated with an image ID, you are responsible for
+keeping track of that. It refers to an image exclusively by the ID.
+
+A more complex mode allows add, removing, updating and querying images for
+multiple databases at once:
+
+$ iqdb command foo.db bar.db baz.db
+
+This mode expects commands on stdin. For a full list see do_commands() in
+iqdb.cpp. The <dbid> argument refers to the dabase on the command line, with
+the first argument being dbid=0. Commands of particular interest are:
+
+	add <dbid> <imgid> [<width> <height>]:<filename>
+		See above.
+	remove <dbid> <imgid>
+		Remove the given image from the DB.
+	rehash <dbid>
+		Re-hash the given database after removing images, before
+		saving or querying it will work again.
+	saveas <dbid> <filename>
+		Save modified database in given file.
+	done now
+		Quit without saving.
+	quit now
+		Quit and save all databases to their original file.
+
+b) Server mode
+
+In query server mode, iqdb loads the databases into memory in read-only mode
+to allow the fastest image queries. No database modifications are possible.
+
+$ iqdb listen [IP:]port [-r] foo.db bar.db baz.db
+
+Listens on the given IP:port (default localhost if no IP given) for commands,
+after loading the given databases. If -r is specified and the port is
+currently in use by another instance of iqdb, it will load the database and
+then terminate that instance, to reduce the downtime due to loading the
+databases.
+
+Of particular interest are the following commands:
+
+	query <dbid> <flags> <numres> <filename>
+		Find numres images most similar to given filename.
+		Flags is a bitmask:
+			0 = normal operation
+			1 = file contains a sketch, use different weights
+			2 = force grayscale match, discard color information
+			8 = consider image width:height as set ID instead and
+			    return only the best match for each set
+			16= discard common coefficients (those present in at
+			    least 10% of all images), this finds an identical
+			    match much faster but the non-matching images have
+			    less similarity
+
+	multi_query <dbid> <flags> <numres> [+ <dbid2> <flags2> <numres2> +...] <filename>
+		Merge query results from multiple databases. This adjusts the
+		individual scores to deal with varying similarity noise levels
+		in different databases (the noise level depends on the number
+		of images in the DB and how self-similar they are).
+
+The server has the following possible responses:
+
+	100 <text>
+		General informational message.
+	101 <key>=<value>
+		Specific parseable information.
+	200 <imgid> <score> <width> <height>
+		Query result.
+	201 <dbid> <imgid> <score> <width> <height>
+		Multi-query result.
+	300 <text>
+		General error message.
+	301 <exception> <description>
+		Non-fatal error message (e.g. invalid image ID, or unreadable
+		image file)
+	302 <exception> <description>
+		Fatal error message (e.g. corrupted database)
+
+3) Querying
+
+The file iqdb.php holds sample PHP code to connect to a running iqdb server
+and queries it for similar images.
+

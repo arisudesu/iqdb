@@ -1,0 +1,148 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+use URI::Escape;
+use JSON::DWIW;
+
+my $tag = shift or die "Give server tag on command line.\n";
+
+our ($user,$pw,$host);
+do "/usr/src/packages/sim/$tag.cfg" and $user and $pw and $host or die "Can't get user/pw/host: $!\n";
+chdir "$ENV{HOME}/doujin/$tag" or die "Can't chdir: $!\n";
+open my $last_post, "<", ".lastid" or die "Can't read .lastid: $!\n";
+$last_post = <$last_post>;
+die "Could not get last post.\n" unless defined $last_post;
+$last_post = 0 + $last_post;
+print "Last post read: $last_post\n";
+
+open my $fres, ">>", "/usr/src/packages/sim/$tag.res" or die "Can't write $tag.cmd: $!\n";
+
+my $ua = MyUserAgent->new;
+$ua->timeout(10);
+$ua->env_proxy;
+
+#$response = file("http://$host/post/index.js?limit=50&login=$user&password_hash=$pw&tags=id%3A172410..172420");
+my @commands;
+my @deleted;
+my $warn = 0;
+$|=1;
+my $last_del;
+if (-M ".last_deleted" > 0.9) {
+	$last_del = 0;
+} else {
+	print "Not getting deleted posts again this time.\n";
+}
+while(defined $last_del) {
+utime time, time, ".last_deleted" or die "Can't touch .last_deleted: $!\n";
+print "Getting deleted after $last_del...\n";
+#my ($response,$error) = $json->from_json(get "http://$host/post/index.js?login=$user&password_hash=$pw&tags=".uri_escape "id:>$last_del order:id deleted:true");
+my $response = $ua->get_json("http://$host/post/index.js?limit=100&login=$user&password_hash=$pw&tags=".uri_escape "id:>$last_del order:id deleted:true");
+last unless @$response;
+for (@$response) {
+	$last_del = $_->{id};
+	$_->{md5} =~ /^(.)(.)(.)/;
+	my $fn = "$1/$2/$3/$_->{md5}.jpg";
+	$fn = glob "xx/*-$_->{md5}.jpg" unless -e $fn;
+	#print "Already gone!\n" and
+	next unless $fn and -e $fn;
+	print "Deleting  $_->{id} = $_->{md5}.\n";
+	my $target = "todelete/".substr $fn, 1+rindex $fn,"/";
+	rename $fn,$target  or die "Can't rename $fn to $target: $!\n";
+}
+}
+while(1) {
+my $response = $ua->get_json("http://$host/post/index.js?limit=100&login=$user&password_hash=$pw&tags=".uri_escape "id:>$last_post order:id");
+last unless @$response;
+my $err = 0;
+for (@$response) {
+	die "Invalid row (no ID): $_\n" unless $_->{id};
+
+	my $id = $_->{id};
+	$last_post=$id if $id > $last_post;
+
+	die "Invalid row (no URL): $_\n" unless $_->{preview_url};
+	my $url = $_->{preview_url};
+
+	my $md5 = $_->{md5};
+	die "Invalid md5: $md5\n" unless length $md5 == 32;
+	if ($url =~ m#/(default|download|deleted)\.png$#) {
+		print "$id: $url SKIPPED\n";
+		next;
+	}
+
+	if ($_->{width} && $_->{height}) {
+		print $fres "$md5 $_->{width} $_->{height}\n";
+	}
+
+	my ($file,$suf) = ($md5, substr $url, rindex $url, ".");
+	$file =~ /^(.)(.)(.)/;
+	$file = "$1/$2/$3/$file$suf";
+	print "$id: $url -> $file: ";
+	print "Exists.\n" and next if -e $file;
+	my $tmpfile = "new/$md5$suf";
+
+	my $res = $ua->mirror($url, $tmpfile);
+	if ($res->code == 403) {
+		print "Skipped (403)\n";
+		print STDERR "$url ($id): ".$res->status_line."\n";
+		$warn++;
+		next;
+	}
+	if ($res->code == 404) {
+		print "Skipped (404)\n";
+		print STDERR "$url ($id): ".$res->status_line."\n";
+		$warn++;
+		next;
+	}
+	if ($res->code >= 500) {
+		print "Failed (".$res->status_line.")! Aborting.\n";
+		die "$url ($id): ".$res->status_line."\n";
+	}
+	if (!is_success $res) {
+		print "FAILED\n";
+		print STDERR "$url: ".$res->status_line."\n";
+		$err = 1;
+		next;
+	}
+	rename $tmpfile, $file or die "Can't move $tmpfile to $file: $!\n";
+	print "OK ", -s $file, "\n";
+}
+die "Had errors.\n" if $err;
+
+print "Last post: $last_post\n";
+open my $out, ">", ".lastid" or die "Can't write .lastid: $!\n";
+print $out $last_post or die $!;
+close $out or die $!;
+}
+
+die "Had $warn warnings.\n" if $warn > 4;
+warn "Had $warn warnings.\n" if $warn;
+
+package MyUserAgent;
+use base qw(LWP::UserAgent);
+sub prepare_request {
+	my $self = shift;
+	my $req = $self->SUPER::prepare_request(shift);
+	$req->header(Referer => "http://$host/");
+	return $req;
+}
+sub get_json {
+	my ($self,$url) = @_;
+	my $res = $self->get($url);
+	die "Could not get json response: ".$res->status_line.".\nURL was: $url\n" unless $res->is_success;
+	#open my $json, ">", "last.js" or die; print $json $res->content; close $json;
+
+	$res = $res->content;
+	while ($res =~ s/(\\(['"]))//g) {
+		warn "Escaped quote: $1. Removed.\n";
+		#$warn++;
+	}
+	#open my $json, ">", "last.jsf" or die; print $json $res; close $json;
+	#print STDERR "Parsing...";
+	$res = JSON::DWIW::deserialize $res;
+	#print STDERR "done.\n";
+	die "JSON returned ".JSON::DWIW::get_error_string()."\n" unless defined $res;
+	return $res;
+}

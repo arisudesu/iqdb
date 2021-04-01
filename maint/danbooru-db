@@ -1,0 +1,103 @@
+#!/usr/bin/perl
+use File::Find;
+
+my $tag = shift or die "Give server tag on command line.\n";
+chdir "$ENV{HOME}/doujin/$tag" or die "Can't chdir: $!\n";
+my $db_file = "$ENV{HOME}/stuff/$tag.idb";
+
+print "Checking for dupe IDs...\n";
+
+sub get_id {
+	return unless -f;
+	return if /\.last/ or m#/deleted/# or m#/todelete/#;
+	m#/(xx)/([0-9a-f]{8})-([0-9a-f]{32})\.# or
+	m#((?:/[0-9a-f]){3})/([0-9a-f]{32})\.# or die "Malformed: $_\n";
+
+	$pref = "/".substr($2,0,1)."/".substr($2,1,1)."/".substr($2,2,1);
+	die "Should be $pref but is $1: $_\n " if $pref ne $1 and $1 ne "xx";
+
+	my @id = (substr $2, 0, 8);
+	push @id, substr $3, 0, 8 if $3;
+	return @id;
+}
+
+$|=1;
+my $total = 0;
+my %dup;
+sub dupe_find {
+	my @id = get_id or next;
+	$total++;
+	for $id (@id) {
+	#print "$id $_";
+	if ($d{$id}) {
+		print "DUPLICATE: $_ / $d{$id}\n" unless $d{$id} =~ m#/xx/# and m#/xx/#;
+		$dup{$_} = 1;
+		$dup{$d{$id}} = 1;
+	} else { $d{$id} = $_; } 
+	}
+}
+find ({wanted=>\&dupe_find, no_chdir=>1}, ".");
+
+for (sort keys %dup) {
+	#print "$_ is ok" and 
+		next if m#/xx/#;
+	$o = $_;
+	do { $r = sprintf "%08x", 1 + rand 0xfffffffd } while $d{$r};
+	$d{$r} = 1;
+	s#((?:/[0-9a-f]){3})/#/xx/$r-# or die "$_";
+	print "Moving $o to $_\n";
+	rename $o, $_ or die "$!\n";
+}
+print "$total files examined.\n";
+undef %dup;
+
+print "Removing images...\n";
+#open my $imgSeek, ">&STDOUT" or die;
+open my $imgSeek, "|-", "$ENV{HOME}/bin/imgSeek", "command", $db_file or die "Can't run imgSeek: $!\n";
+select $imgSeek; $|=1; select STDOUT;
+
+my @deleted;
+sub add {
+	my @id = get_id or next;
+	print $imgSeek "add 0 $id[0]:$_\n";
+}
+sub remove {
+	return unless -f;
+	return if /\.last/ or m#/deleted/#;
+	m#/([0-9a-f]{8})-([0-9a-f]{32})\.# or
+	m#/([0-9a-f]{32})\.# or die "Malformed: $_\n";
+	push @deleted, $_;
+	my $id = substr $1, 0, 8;
+	print $imgSeek "remove 0 $id\n";
+}
+find ({wanted=>\&remove, no_chdir=>1}, "todelete");
+if (@deleted) {
+	print scalar @deleted, " images removed. Rehashing.\n";
+	print $imgSeek "rehash 0\n";
+}
+print "Adding images...\n";
+find ({wanted=>\&add, no_chdir=>1}, ".");
+print "Setting resolutions...\n";
+open my $res, "<", "/usr/src/packages/sim/$tag.res" or warn "Can't read $tag.res: $!\n";
+while (<$res>) {
+	my ($md5,$width,$height) = split " ";
+	/(.)(.)(.)/;
+	my @f = glob "./$1/$2/$3/$md5*";
+	@f = glob "./xx/*-$md5*" unless @f;
+	warn "Could not find ID for MD5 $md5!\n" and next unless @f == 1;
+	$_ = $f[0];
+	my @id = get_id;
+	print $imgSeek "set_res 0 $id[0] $width $height\n";
+}
+print "Saving...\n";
+print $imgSeek "quit now\n";
+close $imgSeek or die "Can't close imgSeek: $!\n";
+unlink "/usr/src/packages/sim/$tag.res" or warn "Can't delete $tag.res: $!\n";
+
+print "Moving deleted files...";
+for (@deleted) {
+	my $o = $_;
+	s/todelete/deleted/;
+	rename $o, $_ or die "Can't rename $o, $_: $!\n";
+}
+print "Done!\n";
