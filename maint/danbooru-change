@@ -9,7 +9,7 @@ use File::Find;
 use Compress::Zlib;
 
 # danbooru-change [-l] tag [-r] [-w<num>] mode [max]
-# tag=site mode=update/full/deleted/fromdb -l no lock -r no online update
+# tag=site mode=update/full/deleted/fromdb/imagecheck -l no lock -r no online update
 
 my $nolock = shift, 1 if @ARGV and $ARGV[0] eq '-l';
 die "No lockfile!\n" unless $nolock or -e "update.lock";
@@ -58,8 +58,8 @@ sub failed {
 	my $failed = get_failed();
 	put_failed($failed + 1);
 	print STDERR "$tag: Failed $failed times before.\n", @_ if $failed;
-	# only die for second message, again after 4 hours and then every ~24 hours
-	print STDERR @_ and exit unless $failed == 1 or $failed == 8 or $failed == 24 or ($failed & 127) == 127;
+	# only die for fourth and ninth message, then again after 4 hours and then every ~24 hours
+	print STDERR @_ and exit unless $failed == 3 or $failed == 8 or $failed == 24 or ($failed & 127) == 127;
 	die @_;
 };
 
@@ -68,6 +68,12 @@ if ($mode eq 'fromdb') {
 	find({ wanted => sub { return unless -f and m#^([0-9a-f]{32})\.#; $md5{$1} = 1; } }, "0".."9", "a".."f");
 	print scalar keys %md5, " found.\n";
 	get_ids();
+}
+
+if ($mode eq 'imagecheck') {
+	print "Retrieving iqdb image IDs... ";
+	get_ids();
+	print scalar keys %ids_db, " IDs in iqdb DB file, ", scalar keys %ids_online, " IDs online.\n";
 }
 
 my $dbh = DBI->connect("DBI:mysql:database=sim:host=localhost", "simadmin", $password)
@@ -105,6 +111,7 @@ my %deleted;
 
 my $sth_chk = $dbh->prepare("select rating from $table where id=?") or exit 1;
 my $sth_ins = $dbh->prepare("insert into $table (id, rating, md5, post) values (?, ?, ?, ?) on duplicate key update id=values(id),rating=values(rating),post=values(post)") or exit 1;
+my $sth_del;
 
 my %ratings = (a => 0x02, e => 0x04, q => 0x08, s => 0x10);
 
@@ -116,10 +123,27 @@ my $sth;
 if ($mode eq 'fromdb') {
 	$sth = $dbh->prepare("select * from $table") or exit 1;
 	$sth->execute();
+} elsif ($mode eq 'imagecheck') {
+	$sth_del = $dbh->prepare("delete from $table where id=?") or exit 1;
+	$sth = $dbh->prepare("select id from $table") or exit 1;
+	$sth->execute();
+	while (my $id = $sth->fetchrow_array) {
+		if ($ids_db{$id} and $ids_online{$id}) {
+			$ids_db{$id} = $ids_online{$id} = 0;
+			next;
+		}
+		print "Inconsistent: DB ID $id iqdb ", 
+			exists $ids_db{$id} ? $ids_db{$id} : "missing", " online ",
+			exists $ids_online{$id} ? $ids_online{$id} : "missing", "\n";
+
+		push @tofetch, $id;
+	}
+	print scalar @tofetch, " inconsistent IDs.\n";
 }
 
 AGAIN:
 while(!$max or $cnt < $max) {
+	my $curid;
 	my $query;
 	my $posts;
 	if ($mode eq 'full') {
@@ -140,6 +164,35 @@ while(!$max or $cnt < $max) {
 			$posts = MyUserAgent::parse(Compress::Zlib::uncompress($row->{post}));
 			$_->{noinsert} = 1 for @$posts;
 		}
+	} elsif ($mode eq 'imagecheck') {
+		if (!@tofetch) {
+			print "Checking iqdb DB IDs...\n";
+			while (my ($id, $val) = each %ids_db) {
+				next unless $val;
+				print "ID $id in iqdb DB is not in database.\n";
+				delete $ids_db{$id};
+				push @tofetch, $id;
+				push @remove, sprintf "0x%x", $id;
+			}
+		}
+		if (!@tofetch) {
+			print "Checking online DB IDs...\n";
+			while (my ($id, $val) = each %ids_online) {
+				next unless $val;
+				print "ID $id in online DB is not in database.\n";
+				delete $ids_online{$id};
+				push @tofetch, $id;
+				push @remove, sprintf "0x%x", $id;
+			}
+		}
+		if (!@tofetch) {
+			print "ID check complete.\n";
+			last;
+		}
+
+		$curid = shift @tofetch;
+		print "Trying to get ID $curid...\n";
+		$query = "id:$curid";
 	} else {
 		die "$tag: Unknown mode: $mode\n";
 	}
@@ -153,9 +206,17 @@ while(!$max or $cnt < $max) {
 		my $login = $user ? "&login=$user&password_hash=$pw" : '';
 		$req_url = "http://$host/post/index.xml?limit=100$login&tags=".uri_escape $query;
 	}
-	$req_url =~ s/(password_hash=)[^&]*/$1(hidden)/;
-	$posts = $ua->get_posts($req_url) if $query;
+	$posts = $ua->get_posts(\$req_url) if $query;
 	failed "$tag: $req_url\n$posts\n" unless ref $posts eq 'ARRAY';
+	if ($mode eq 'imagecheck') {
+		if (@$posts == 0) {
+			print "Post $curid does not exist, removing from DB.\n";
+			$sth_del->execute($curid);
+			next;
+		}
+		die "FAILED! GOT ".(scalar @$posts)." POSTS!\n" if @$posts != 1;
+		$_->{force_update} = 1 for @$posts;
+	}
 	if (!@$posts) {
 		$last_max = undef;
 		print "No more posts, we're done!\n";
@@ -163,7 +224,7 @@ while(!$max or $cnt < $max) {
 	}
 	for (@$posts) {
 		process() or $err++;
-		my $next_max = $max > 0 ? $max * 2 / 5 : 500;
+		my $next_max = $max > -1 ? $max * 2 / 5 : 500;
 		if (time - $start_time > 60*5 and not $nolock) {
 			put_last("max", $next_max);
 			failed "$tag: Update taking over 5 minutes, aborting. Next time will try only $next_max\n";
@@ -276,11 +337,11 @@ sub process {
 		}
 		$file = "";
 
-	} elsif ($url =~ m#/(default|download|deleted|download-preview)\.png$#) {
+	} elsif ($url =~ m#/(default|download|deleted|download-preview)\.png$#) {	## deconfuse vim
 		print "SKIPPED" unless $quiet;
 		$file = "";
 
-	} elsif (-e $file) {
+	} elsif (-e $file and not $_->{force_update}) {
 		print "Exists" unless $quiet;
 
 	} elsif ($suf ne '.jpg') {
@@ -307,8 +368,13 @@ sub process {
 	my $rating = $ratings{$_->{rating}};
 	die "$tag: $id: Unknown rating `$_->{rating}'\n" unless $rating;
 
-	push @insert,[$id,$_->{rating},$md5,Compress::Zlib::compress($_->{raw}, 9)] unless $_->{noinsert};
-	my $rows = $sth_chk->execute($id);
+	if ($_->{force_update} and not $file) {
+		print " No file, removing from DB.";
+		$sth_del->execute($id);
+	} else {
+		push @insert,[$id,$_->{rating},$md5,Compress::Zlib::compress($_->{raw}, 9)] unless $_->{noinsert};
+	}
+	my $rows = $_->{force_update} ? 0 : $sth_chk->execute($id);
 	if ($rows == 1) {
 		my @row = $sth_chk->fetchrow_array or exit 1;
 		$row[0] ||= "";
@@ -322,6 +388,8 @@ sub process {
 	}
 	if ($file) {
 		push @add, [$id, sprintf "0x%x 1 $rating:$ENV{HOME}/doujin/$tag/$file", $id];
+	} else {
+		print " no file";
 	}
 	print " OK\n" unless $quiet;
 	return defined $file;
@@ -424,7 +492,7 @@ sub update_iqdb {
 		print "Opening connection for ", @add+@remove+@update, " commands...\n";
 		my $nc;
 		unless ($no_online) {
-			open $nc, "| nc s2.iqdb.hanyuu.net 5588 2>&1|tee -a /dev/fd/2|egrep -v -q ^3 2>&1" or die "$tag: Can't start nc: $!\n";
+			open $nc, "| nc s3.iqdb.hanyuu.net 5588 2>&1|tee -a /dev/fd/2|egrep -v -q ^3 2>&1" or die "$tag: Can't start nc: $!\n";
 			select $nc; $|=1; select STDOUT;
 		}
 
@@ -491,7 +559,7 @@ sub get_ids {
 	return if $no_online;
 
 	print "Retrieving online ids... ";
-	open my $nc, "-|", "echo -e 'list $dbid\\ndone now\\n'|nc localhost 5566" or die "$tag: Can't start nc: $!\n";
+	open my $nc, "-|", "echo -e 'list $dbid\\ndone now\\n'|nc s3.iqdb.hanyuu.net 5588 " or die "$tag: Can't start nc: $!\n";
 	while (<$nc>) {
 		chomp;
 		/^000 / and next;
@@ -511,9 +579,9 @@ sub prepare_request {
 	return $req;
 }
 sub get_posts {
-	my ($self,$url) = @_;
+	my ($self,$url_ref) = @_;
 	$self->default_header("Accept-Encoding" => "gzip, deflate");
-	my $res = $self->get($url);
+	my $res = $self->get($$url_ref);
 	$self->default_headers->remove_header("Accept-Encoding");
 	my $try = 0;
 	while ($res->status_line eq '500 read timeout') {
@@ -521,8 +589,10 @@ sub get_posts {
 		last if $try > 2;
 		sleep (2 << $try);
 		print STDERR "$tag: ", $res->status_line, ", trying again.\n";
-		$res = $self->get($url);
+		$res = $self->get($$url_ref);
 	}
+	$$url_ref =~ s/(password_hash=)[^&]*/$1(hidden)/;
+	my $url = $$url_ref;
 	::failed "$tag: Could not get xml response: ".$res->status_line.".\nURL was: $url\n" unless $res->is_success;
 	open my $xml, ">", "/usr/src/packages/sim/last.zxml" or die "$tag: Can't write last.zxml: $!\n"; print $xml $res->content; close $xml;
 
