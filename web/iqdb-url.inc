@@ -162,7 +162,7 @@ function __construct($url) {
 	$this->setopt(CURLOPT_FOLLOWLOCATION, true); 
 	$this->setopt(CURLOPT_MAXREDIRS, 5); 
 	$this->setopt(CURLOPT_HTTPHEADER, array("Pragma: "));
-	$this->setopt(CURLOPT_USERAGENT, "iqdb/0.1 (+http://iqdb.yi.org/)");
+	$this->setopt(CURLOPT_USERAGENT, "iqdb/0.1 (+http://iqdb.org/)");
 	//$this->setopt(CURLOPT_FILE, $this->file->fd);
 }
 

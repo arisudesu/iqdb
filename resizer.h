@@ -30,6 +30,16 @@ struct image_info {
 	image_types type;
 };
 
+struct resizer_result {
+	gdImagePtr image;
+	unsigned int via_x, via_y;
+
+	operator gdImagePtr() { return image; }
+
+	resizer_result(gdImagePtr i) : image(i), via_x(0), via_y(0) {}
+	resizer_result(gdImagePtr i, unsigned int x, unsigned int y) : image(i), via_x(x), via_y(y) {}
+};
+
 // Use this to wrap the return code of e.g. resize_image_data
 // to make sure it is always cleaned up, even with exceptions.
 typedef AutoCleanPtrF<gdImage, &gdImageDestroy> AutoGDImage;
@@ -55,5 +65,5 @@ size_t get_image_info(const unsigned char* data, size_t length, image_info* info
 // JPEG		4*dim
 // PNG		
 // GIF
-gdImagePtr resize_image_data(const unsigned char* data, size_t len, unsigned int thu_x, unsigned int thu_y, bool allow_prescaled);
+resizer_result resize_image_data(const unsigned char* data, size_t len, unsigned int thu_x, unsigned int thu_y, bool allow_prescaled);
 

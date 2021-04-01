@@ -8,7 +8,7 @@ use URI::Escape;
 use File::Find;
 use Compress::Zlib;
 
-# danbooru-change [-l] tag [-r] mode
+# danbooru-change [-l] tag [-r] [-w<num>] mode [max]
 # tag=site mode=update/full/deleted/fromdb -l no lock -r no online update
 
 my $nolock = shift, 1 if @ARGV and $ARGV[0] eq '-l';
@@ -17,14 +17,17 @@ die "No lockfile!\n" unless $nolock or -e "update.lock";
 #system("renice 15 $$");
 my $tag = shift or die "Give server tag on command line.\n";
 my $no_online = shift, 1 if @ARGV and $ARGV[0] eq '-r';
+my $warnmax = 4;
+$warnmax = 0+$1 if @ARGV and $ARGV[0] =~ /-w(\d+)/ and shift;
 my $mode = "update";
 $mode = shift if @ARGV and ($ARGV[0] =~ /^[a-z]+$/);
 my $max = 0+(shift||0);
 my $cnt = 0;
+my $start_time = time;
 print "Getting no more than $max posts.\n" if $max > 0;
 
-our ($user,$pw,$host,$table,$dbid,$db_file,$url);
-do "/usr/src/packages/sim/$tag.cfg" and ($user and $pw or $url) and $host and $table and $dbid and $db_file or die "$tag: Can't get DB settings: $!\n";
+our ($user,$pw,$host,$table,$dbid,$db_file,%url,$def_rating);
+do "/usr/src/packages/sim/$tag.cfg" and (defined $user and defined $pw or %url) and $host and $table and $dbid and $db_file or die "$tag: Can't get DB settings: $!\n";
 $db_file="/opt/stuff/$db_file";
 die "$tag: $db_file does not exist\n" unless -e $db_file;
 chdir "$ENV{HOME}/doujin/$tag" or die "$tag: Can't chdir: $!\n";
@@ -33,12 +36,19 @@ print "Site: $tag Mode: $mode\n";
 
 my $last_change = get_last('change');
 my $last_post = get_last('id');
+my $last_max = eval { get_last('max') };
+$max = $last_max if $last_max;
 
 my $pwfile = "$ENV{HOME}/.dou-pw-admin";
 open my $f, "<", $pwfile or die "$tag: Can't read $pwfile: $!\n";
 my $password = <$f>;
 chomp $password;
 die "$tag: No password in $pwfile\n" unless $password;
+
+$|=1;
+open $f, ">", ".curmode" or die "$tag: Can't write .curmode: $!\n";
+print $f $mode;
+close $f;
 
 my %ids_db;
 my %ids_online;
@@ -47,11 +57,9 @@ my %md5;
 sub failed {
 	my $failed = get_failed();
 	put_failed($failed + 1);
-	if ($failed) {
-		print STDERR "$tag: Failed $failed times before.\n", @_;
-		# only die for first message, again after 4 hours and then every ~24 hours
-		exit unless $failed == 6 or $failed == 24 or ($failed & 127) == 0;
-	}
+	print STDERR "$tag: Failed $failed times before.\n", @_ if $failed;
+	# only die for second message, again after 4 hours and then every ~24 hours
+	print STDERR @_ and exit unless $failed == 1 or $failed == 8 or $failed == 24 or ($failed & 127) == 127;
 	die @_;
 };
 
@@ -75,17 +83,16 @@ $dbh->do(<<EOT) or die "$tag: FAILED.\n";
 		UNIQUE INDEX(id),
 		PRIMARY KEY(id),
 		UNIQUE INDEX(md5)
-	) CHARSET=utf8;
+	) CHARSET=utf8 INDEX DIRECTORY='/var/lib/mysql-index/sim' DATA DIRECTORY='/var/lib/mysql-data/sim';
 EOT
 
 my $ua = MyUserAgent->new;
 $ua->timeout(10);
 $ua->env_proxy;
-$ua->default_header("Accept-Encoding" => "gzip, deflate");
-$ua->agent("iqdb/0.1 (+http://iqdb.yi.org/)");
+$ua->agent("iqdb/0.1 (+http://iqdb.org/)");
 
 use LWP::ConnCache;
-$ua->conn_cache(LWP::ConnCache->new());
+$ua->conn_cache(LWP::ConnCache->new(5));
 
 my @remove;
 my @add;
@@ -118,6 +125,7 @@ while(!$max or $cnt < $max) {
 	if ($mode eq 'full') {
 		$query = "change:>$last_change order:change";
 	} elsif ($mode eq 'deleted') {
+		die "This should probably use status:deleted now.\n";
 		$query = "id:>$last_del order:id deleted:true";
 	} elsif ($mode eq 'update') {
 		$query = "id:>$last_post order:id";
@@ -136,20 +144,33 @@ while(!$max or $cnt < $max) {
 		die "$tag: Unknown mode: $mode\n";
 	}
 	my $req_url;
-	if ($url) {
-		my %values = (ID => $last_post);
-		$req_url = $url;
-		$req_url =~ s/<([A-Z]+)>/$values{$1}/g;
+	if (%url) {
+		my %values = (ID => $last_post, CHANGE => $last_change);
+		failed "$tag: mode '$mode' has no URL\n" unless exists $url{$mode};
+		$req_url = $url{$mode};
+		$req_url =~ s/<([A-Z]+)>/exists $values{$1} or die "$1\n"; $values{$1}/eg;
 	} else {
-		$req_url = "http://$host/post/index.xml?limit=100&login=$user&password_hash=$pw&tags=".uri_escape $query;
+		my $login = $user ? "&login=$user&password_hash=$pw" : '';
+		$req_url = "http://$host/post/index.xml?limit=100$login&tags=".uri_escape $query;
 	}
+	$req_url =~ s/(password_hash=)[^&]*/$1(hidden)/;
 	$posts = $ua->get_posts($req_url) if $query;
-	last unless @$posts;
+	failed "$tag: $req_url\n$posts\n" unless ref $posts eq 'ARRAY';
+	if (!@$posts) {
+		$last_max = undef;
+		print "No more posts, we're done!\n";
+		last;
+	}
 	for (@$posts) {
 		process() or $err++;
+		my $next_max = $max > 0 ? $max * 2 / 5 : 500;
+		if (time - $start_time > 60*5 and not $nolock) {
+			put_last("max", $next_max);
+			failed "$tag: Update taking over 5 minutes, aborting. Next time will try only $next_max\n";
+		}
 	}
 	failed "$tag: Had errors.\n" if $err;
-	failed "$tag: Had $warn warnings.\n" if $warn > 4;
+	failed "$tag: Had $warn warnings.\n" if $warn > $warnmax;
 
 	print "Last change ID and post ID so far: $last_change - $last_post\n" unless $mode eq 'fromdb';
 	update() if @add >= 500 or @insert >= 500;
@@ -173,6 +194,12 @@ goto AGAIN if @tofetch;
 update();
 failed "$tag: Had $warn warnings.\n" if $warn;
 put_failed(0);
+if (defined $last_max) {
+	print "Still not all posts, trying $last_max more next time.\n";
+	put_last("max", $last_max);
+} else {
+	unlink ".lastmax";
+}
 
 sub get_last {
 	open my $last_f, "<", ".last$_[0]" or die "$tag: Can't read .last$_[0]: $!\n";
@@ -202,14 +229,18 @@ sub put_failed {
 	open my $out, ">", ".failed" or die "$tag: Can't write .failed: $!\n";
 	print $out $_[0] or die "$tag: $!\n";
 	close $out or die "$tag: $!\n";
+	unlink ".curmode";
 }
 
 sub process {
+	my $quiet = $max > 200;
+
 	$cnt++;
-	failed "$tag: Invalid row (no ID): $_\n" unless $_->{id};
+	failed "$tag: Invalid row (not a hashref): $_\n" unless ref $_ eq 'HASH';
+	failed "$tag: Invalid row (no ID): @{[%$_]}\n" unless $_->{id};
 
 	my $id = $_->{id};
-	failed "$tag: Invalid ID $id: $_\n" unless $id eq 0 + $id;
+	failed "$tag: Invalid ID $id: @{[%$_]}\n" unless $id eq 0 + $id;
 	$id = 0 + $id;
 
 	my $change = $_->{change};
@@ -220,7 +251,8 @@ sub process {
 	$last_post=0+$id if $id > $last_post;
 	$last_del=0+$id if $id > $last_del;
 
-	failed "$tag: Invalid row (no URL): $_\n" unless $_->{preview_url};
+	$_->{preview_url} ||= "deleted.jpg" if $_->{status} eq "disabled";
+	failed "$tag: Invalid row (no URL): @{[%$_]}\n" unless $_->{preview_url};
 	my $url = $_->{preview_url};
 
 	my $md5 = lc $_->{md5};
@@ -228,12 +260,14 @@ sub process {
 
 	my ($file,$suf) = ($md5, substr $url, rindex $url, ".");
 	$suf = ".jpg" unless $suf =~ /^\.[a-z]+$/;
+	$suf = ".jpg" if $suf eq '.jpeg';
 	$file =~ /^(.)(.)(.)/;
 	$file = "$1/$2/$3/$file.jpg";
-	print "$id: $url -> $file:" unless $max;
+	print "$id: $url -> $file:" unless $quiet;
+	print "\r$id \x1b[K" if $quiet;
 
-	if ($_->{status} eq 'deleted') {
-		print "DELETED" unless $max;
+	if ($_->{status} eq 'deleted' or $_->{status} eq 'disabled') {
+		print "DELETED" unless $quiet;
 		push @remove, sprintf "0x%x", $id if $mode ne 'fromdb' or $ids_db{$id} or $ids_online{$id};
 		$deleted{$id} = 1;
 		if (-e $file) {
@@ -243,18 +277,18 @@ sub process {
 		$file = "";
 
 	} elsif ($url =~ m#/(default|download|deleted|download-preview)\.png$#) {
-		print "SKIPPED" unless $max;
+		print "SKIPPED" unless $quiet;
 		$file = "";
 
 	} elsif (-e $file) {
-		print "Exists" unless $max;
+		print "Exists" unless $quiet;
 
 	} elsif ($suf ne '.jpg') {
-		print STDERR "$tag: $id: $url -> $file: " if $max;
+		print STDERR "$tag: $id: $url -> $file: " and $quiet = 0 if $quiet;
 		die "$tag: Suffix `$suf' not .jpg!\n";
 
 	} else {
-		print "$id: $url -> $file:" if $max;
+		print "$url -> $file:" and $quiet = 0 if $quiet;
 		retrieve($url, $md5, $file) or $file = undef;
 	}
 
@@ -269,6 +303,7 @@ sub process {
 		}
 	}
 
+	$_->{rating} = $def_rating if $def_rating and not defined $_->{rating};
 	my $rating = $ratings{$_->{rating}};
 	die "$tag: $id: Unknown rating `$_->{rating}'\n" unless $rating;
 
@@ -288,7 +323,7 @@ sub process {
 	if ($file) {
 		push @add, [$id, sprintf "0x%x 1 $rating:$ENV{HOME}/doujin/$tag/$file", $id];
 	}
-	print " OK\n";
+	print " OK\n" unless $quiet;
 	return defined $file;
 }
 
@@ -296,6 +331,7 @@ sub retrieve {
 	my ($url, $md5, $file) = @_;
 	my $tmpfile = "new/$md5.jpg";
 
+	unlink $tmpfile;
 	my $res = $ua->mirror($url, $tmpfile);
 	if ($res->code == 500) {
 		print "Failed (".$res->status_line.")! Trying again. ";
@@ -309,9 +345,9 @@ sub retrieve {
 	}
 	#if ($res->code == 404) {
 	#	print "Skipped (404)\n";
-	#	print STDERR "$tag: $url ($id): ".$res->status_line."\n";
-	#	$warn++;
-	#	next;
+	#	print STDERR "$tag: $url: ".$res->status_line."\n";
+	#	#$warn++;
+	#	return 1;
 	#}
 	if ($res->code >= 500) {
 		print "Failed (".$res->status_line.")! Aborting.\n";
@@ -327,14 +363,41 @@ sub retrieve {
 	sysread $f, my $fhdr, 10 or die "$tag: Can't read $tmpfile: $!\n";
 	use bytes;
 	my $jpeghdr = "\xFF\xD8\xFF\xE0\x00\x10\x4A\x46\x49\x46";
-	$fhdr eq $jpeghdr or failed "$tag: No JPEG header:\nGot= $fhdr\nWant=$jpeghdr\n";
+	if ($fhdr ne $jpeghdr) {
+		sysread $f, $fhdr, 128*1024, -1 or die "$tag: Can't read $tmpfile: $!\n";
+		if (-1 == index $fhdr, "No such file or directory: ") {
+			$fhdr = join " ", map { sprintf "%02x", ord $_ } split //, $fhdr, length $jpeghdr;
+			$jpeghdr = join " ", map { sprintf "%02x", ord $_ } split //, $jpeghdr;
+			failed "$tag: No JPEG header:\nGot= $fhdr\nWant=$jpeghdr\n";
+		}
+		print "Failed (No such file or directory)\n";
+		print STDERR "$tag: $url: No such file or directory\n";
+		$warn++;
+		unlink $tmpfile;
+		return 1;
+	}
+	print -s $tmpfile;
 	rename $tmpfile, $file or die "$tag: Can't move $tmpfile to $file: $!\n";
-	print -s $file;
+	#print -s $file; -- not always present right away on NFS
 	return 1;
 }
 
 sub update {
-	update_iqdb() if @add or @remove or @update;
+	my @toadd = @add;
+	my @toremove = @remove;
+	my @toupdate = @update;
+	if (@add or @remove or @update) {
+		if (!update_iqdb()) {
+			print "iqdb update failed, trying again after 10 seconds\n";
+			@add = @toadd;
+			@remove = @toremove;
+			@update = @toupdate;
+			sleep 10;
+			if (!update_iqdb()) {
+				failed "$tag: iqdb update failed";
+			}
+		}
+	}
 	update_db() if @insert;
 	print "Last committed change/post: $last_change $last_post\n";
 	
@@ -350,14 +413,18 @@ sub update_iqdb {
 
 	$SIG{PIPE} = 'IGNORE';
 	$|=1;
-	open my $iqdb, "|-", "$ENV{HOME}/bin/iqdb", "command", $db_file or die "$tag: Can't run iqdb: $!\n";
+	open my $olderr, ">&STDERR" or die "Can't dup STDERR: $!\n";
+	open STDERR, ">&STDOUT" or die "Can't redirect STDERR to STDOUT: $!\n";
+	open my $iqdb, "|$ENV{HOME}/bin/iqdb command $db_file 2>&1|tee -a /dev/fd/2|egrep -v -q ^3 2>&1" or die "$tag: Can't run iqdb: $!\n";
+	open STDERR, ">&", $olderr or die "Can't restore STDERR: $!\n";
 	select $iqdb; $|=1; select STDOUT;
+	system "sync";
 
 	while (@add or @remove or @update) {
 		print "Opening connection for ", @add+@remove+@update, " commands...\n";
 		my $nc;
 		unless ($no_online) {
-			open $nc, "|-", "nc", "localhost", "5566" or die "$tag: Can't start nc: $!\n";
+			open $nc, "| nc s2.iqdb.hanyuu.net 5588 2>&1|tee -a /dev/fd/2|egrep -v -q ^3 2>&1" or die "$tag: Can't start nc: $!\n";
 			select $nc; $|=1; select STDOUT;
 		}
 
@@ -398,11 +465,12 @@ sub update_iqdb {
 		unless ($no_online) {
 			print $nc "done now\n";
 			close $nc;
-			print $iqdb "done now\n" and die "$tag: Online failed!\n" if $?;
+			print $iqdb "done now\n" and return 0 if $?; #die "$tag: Online failed!\n" if $?;
 		}
 	}
 	print $iqdb "quit now\n";
-	close $iqdb or die "$tag: File failed!\n";
+	close $iqdb or return 0; # die "$tag: File failed!\n";
+	return 1;
 }
 
 sub update_db {
@@ -435,6 +503,7 @@ sub get_ids {
 
 package MyUserAgent;
 use base qw(LWP::UserAgent XML::Simple);
+use Encode::Encoding qw(decode);
 sub prepare_request {
 	my $self = shift;
 	my $req = $self->SUPER::prepare_request(shift);
@@ -443,7 +512,9 @@ sub prepare_request {
 }
 sub get_posts {
 	my ($self,$url) = @_;
+	$self->default_header("Accept-Encoding" => "gzip, deflate");
 	my $res = $self->get($url);
+	$self->default_headers->remove_header("Accept-Encoding");
 	my $try = 0;
 	while ($res->status_line eq '500 read timeout') {
 		$try++;
@@ -458,30 +529,31 @@ sub get_posts {
 	my $decoded = $res->decoded_content();
 	::failed "$tag: Could not decode content: $@\nURL was: $url\nUndecoded length is ".length $res->content,"\n" unless $decoded;
 
-	my $line;
-	while (1) {
-		my @lines = split /(?<=\>)\s+/, $decoded;
-		if ($lines[0] =~ /^<html>/ and $decoded =~ /maintenance/i) {
-			$line = "Maintenance: $lines[0]";
-			print STDERR "$tag: maintenance\n";
-			return [];
-		}
-		$line = shift @lines; $line = "No XML header: $line" and last unless $line =~ /^<\?xml/;
-		$line = shift @lines; $line = "No posts root tag: $line" and last unless $line =~ /^<posts/;
-		return parse(@lines);
+	my $err = "No XML header: ".substr($decoded, 0, 40);
+	while ($decoded =~ s/^\s*<\?xml[^>]*>\s*<([a-z]+)[^>]*>\s*//i) {
+		$err = "Root tag is '$1' not 'posts' or 'images'\n" and last unless $1 eq 'posts' or $1 eq 'images';
+
+		return parse(split /(?<=\>)\s+/, $decoded);
+	}
+
+	if ($decoded =~ /^<html>.*maintenance/i) {
+		print STDERR "$tag: maintenance\n";
+		return [];
 	}
 
 	open my $dump, ">", "/usr/src/packages/sim/last.xml";
 	print $dump $decoded;
 	close $dump;
-	::failed "$tag: XML parsing failed: $line\n";
+	::failed "$tag: XML parsing failed: $err\n";
 }
 
 sub parse {
 	my @posts;
 	for (@_) {
-		next if /^\s*$/ or m#^\s*</posts#;
+		last if m#^\s*</[a-z]#;
+		next if /^\s*$/;
 		my $post = eval { XML::Simple::XMLin($_) };
+		$post = eval { print STDERR "XML decode failed, trying to fix UTF-8. "; $_ = Encode::decode("utf8", $_, Encode::FB_XMLCREF); XML::Simple::XMLin($_) } if $@;
 		return "$_: $@" if $@;
 		$post->{raw} = $_;
 		push @posts, $post;

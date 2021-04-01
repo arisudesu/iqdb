@@ -1,12 +1,8 @@
 #!/bin/sh
+
 cd /usr/src/packages/sim
-#exec >> refresh.log 2>> refresh.err
-#date
-#date 1>&2
-if [ `id -u` -ne 502 ]; then
-	echo Incorrect user ID: `id`
-	exit 1;
-fi
+export HOME=/opt/iqdb
+
 EC=0
 if ! lockfile -r 0 update.lock; then
 	echo Failed to obtain lock, aborting.
@@ -15,7 +11,6 @@ fi
 trap "rm -f update.lock" SIGHUP SIGINT SIGQUIT SIGTERM EXIT
 
 export http_proxy=http://localhost:3128/
-#export http_proxy=http://rps:3129/
 
 MODE="$1"
 if [ "$MODE" = "auto" ]; then
@@ -29,7 +24,9 @@ if [ "$MODE" = "update" ]; then
 	./danbooru-change moe.imouto || let EC=$EC+2
 	./danbooru-change 4scrape    || let EC=$EC+2
 	./danbooru-change sankaku    || let EC=$EC+2
-	#./danbooru-change kurankuran || let EC=$EC+2
+	./danbooru-change e-shuushuu || let EC=$EC+2
+	./danbooru-change 3dbooru    || let EC=$EC+2
+	./danbooru-change nekobooru  || let EC=$EC+2
 
 	touch ~/doujin/.lastquickupdate ~/doujin/.lastupdate
 	exit $EC
@@ -41,38 +38,13 @@ elif [ "$MODE" = "full" ]; then
 	./danbooru-change moe.imouto full  || let EC=$EC+2
 	./danbooru-change 4scrape          || let EC=$EC+2
 	./danbooru-change sankaku    full  || let EC=$EC+2
-	#./danbooru-change kurankuran full  || let EC=$EC+2
+	./danbooru-change e-shuushuu full  || let EC=$EC+2
+	./danbooru-change 3dbooru    full  || let EC=$EC+2
+	./danbooru-change nekobooru  full  || let EC=$EC+2
 
 	touch ~/doujin/.lastfullupdate ~/doujin/.lastupdate
 	exit $EC
-elif [ "$MODE" != "restart" ]; then
-	echo Unknown mode, run as $0 auto/update/full/restart
+else
+	echo Unknown mode, run as $0 auto/update/full
 	exit 1;
 fi;
-
-SCREEN=iqdbOne
-OTHER=iqdbTwo
-screen -ls|grep iqdb
-if screen -ls|grep $SCREEN &> /dev/null; then
-	SCREEN=iqdbTwo
-	OTHER=iqdbOne
-fi;
-PID=`screen -ls|grep $OTHER|perl -lne 'print $1 if /(\d+)/'`
-echo "Starting screen $SCREEN (other $OTHER pid $PID)"
-screen -dmS $SCREEN ~/bin/iqdb.server listen2 5566 -r `./def-dbs`
-echo Waiting for $PID to exit.
-COUNT=0
-while [ -n "$PID" -a -d /proc/$PID ]; do
-	let COUNT=$COUNT+1
-	if [ $COUNT -gt 120 ]; then echo "Waited too long, aborting."; exit 1; fi;
-	sleep 2;
-done;
-echo Waited $COUNT*2 seconds.
-COUNT=0
-while ! echo  -e "ping me\ndone now\n"|nc localhost 5566; do
-	let COUNT=$COUNT+1
-	if [ $COUNT -gt 3 ]; then echo "Waited too long, aborting."; exit 1; fi;
-	sleep 5;
-done;
-touch ~/doujin/.lastrestart
-exit $EC

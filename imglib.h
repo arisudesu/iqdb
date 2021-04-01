@@ -439,6 +439,9 @@ struct id_index_iterator<true,B> : public B {
 // Simplify reading/writing stream data.
 #define READER_WRAPPERS \
 	template<typename T> \
+	T read_size(int size) { union { char s[16]; T v; } dummy; dummy.v = 0; base_type::read(dummy.s, size); return dummy.v; } \
+	\
+	template<typename T> \
 	T read() { T dummy; base_type::read((char*) &dummy, sizeof(T)); return dummy; } \
 	\
 	template<typename T> \
@@ -484,6 +487,7 @@ public:
 	virtual void addImageBlob(imageId id, const void *blob, size_t length);
 
 	static void imgDataFromFile(const char* filename, imageId id, ImgData* img);
+	static void imgDataFromBlob(const void* data, size_t data_size, imageId id, ImgData* img);
 
 	static bool is_grayscale(const lumin_int& avgl);
 
@@ -522,14 +526,14 @@ protected:
 		colbucket& operator[] (size_t ind) { return buckets[ind]; }
 		B& at(int col, int coef, int* idxret = NULL);
 
-		void add(const ImgData& img, size_t index);
+		void add(const ImgData& img, count_t index);
 		void remove(const ImgData& img);
 
 		iterator begin() { return buckets[0][0]; }
 		iterator end() { return buckets[count_0][0]; }
 
-		static size_t count() { return count_0 * count_1 * count_2; }
-		static size_t size() { return count() * sizeof(B); }
+		static count_t count() { return count_0 * count_1 * count_2; }
+		static count_t size() { return count() * sizeof(B); }
 
 	private:
 		colbucket buckets[count_0];
@@ -625,7 +629,7 @@ private:
 
 	struct bucket_type : public imageIdIndex_list<is_simple, is_memory> {
 		typedef imageIdIndex_list<is_simple, is_memory> base_type;
-		void add(image_id_index id, size_t index) { base_type::push_back(is_simple ? image_id_index(index, true) : image_id_index(id)); }
+		void add(image_id_index id, count_t index) { base_type::push_back(is_simple ? image_id_index(index, true) : image_id_index(id)); }
 		void remove(image_id_index id) { base_type::remove(id); }
 	};
 	typedef bucket_set<bucket_type> buckets_t;
@@ -678,10 +682,10 @@ private:
 	void move_deleted();
 
 	struct bucket_type {
-		void add(image_id_index id, size_t index) { size++; }
+		void add(image_id_index id, count_t index) { size++; }
 		void remove(image_id_index id) { size--; }
 
-		size_t size;
+		count_t size;
 	};
 
 	typedef std::vector<size_t> DeletedList;
@@ -689,7 +693,7 @@ private:
 	ImageMap m_images;
 	db_fstream* m_f;
 	std::string m_fname;
-	off_t m_hdrOff, m_sigOff, m_imgOff;
+	offset_t m_hdrOff, m_sigOff, m_imgOff;
 	typedef bucket_set<bucket_type> buckets_t;
 	buckets_t m_buckets;
 	DeletedList m_deleted;
@@ -705,6 +709,16 @@ static const unsigned int	SRZ_V0_5_1			= 1;
 static const unsigned int	SRZ_V0_6_0			= 2;
 static const unsigned int	SRZ_V0_6_1			= 3;
 static const unsigned int	SRZ_V0_7_0			= 8;
+static const unsigned int	SRZ_V0_9_0			= 9;
+
+// Variable size and endianness check
+static const uint32_t		SRZ_V_SZ			= (sizeof(res_t)) |
+								  (sizeof(count_t) << 5) |
+								  (sizeof(offset_t) << 10) |
+								  (sizeof(imageId) << 15) |
+								  (3 << 20);	// never matches any of the above for endian check
+
+static const uint32_t		SRZ_V_CODE			= (SRZ_V0_9_0) | (SRZ_V_SZ << 8);
 
 /* keyword postings structure */
 static const unsigned int	 AVG_IMGS_PER_KWD	= 1000;

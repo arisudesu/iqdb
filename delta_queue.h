@@ -47,7 +47,7 @@ struct delta_iterator : public std::iterator<std::forward_iterator_tag, size_t> 
 
 private:
 	friend class delta_queue;
-	delta_iterator(const delta_value* itr, int ind) : m_p(ptr(itr) + ind + 1 - sizeof(size_t)) { }	// only useful for end()
+	delta_iterator(const delta_value* itr, int ind) : m_p(ptr(itr) + ind - size_t_mask) { }	// only useful for end()
 
 	size_t itr() const { return *(const size_t*)(m_p & ~size_t_mask); }
 	size_t ind() const { return m_p & size_t_mask; }

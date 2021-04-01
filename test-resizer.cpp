@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
 			throw imgdb::io_errno(errno);
 
 		fprintf(stderr, "Mapped %s at %p:%zd.\n", thumb, map, len);
-		AutoGDImage thu = resize_image_data(map, len, thudim, 0, 12*thudim);
+		AutoGDImage thu(resize_image_data(map, len, thudim, 0, 12*thudim));
 
 		FILE *out = fopen(outname, "wb");
 		if (!out) throw imgdb::io_errno(errno);

@@ -12,23 +12,26 @@ IMG_LIB=GD
 # discard it as needed. The app uses as little memory as possible
 # but depending on IO load queries can take longer (sometimes a lot).
 # This option is especially useful for a VPS with little memory.
-# DEFS+=-DUSE_DISK_CACHE
+# override DEFS+=-DUSE_DISK_CACHE
 
 # If you do not have any databases created by previous versions of
 # this software, you can uncomment this to not compile in code for
 # upgrading old versions (use iqdb rehash <dbfile> to upgrade).
-DEFS+=-DNO_SUPPORT_OLD_VER
+override DEFS+=-DNO_SUPPORT_OLD_VER
 
 # Enable a significantly less memory intensive but slightly slower
 # method of storing the image index internally (in simple mode).
-DEFS+=-DUSE_DELTA_QUEUE
+override DEFS+=-DUSE_DELTA_QUEUE
 
 # Disable use of std::tr1::unordered_map if your compiler/C++ library
 # is old and doesn't have it. This will make many things slower.
-# DEFS+=-DNO_TR1
+# override DEFS+=-DNO_TR1
 
 # This may help or hurt performance. Try it and see for yourself.
-DEFS+=-fomit-frame-pointer
+override DEFS+=-fomit-frame-pointer
+
+# Force use of a platform independent 64-bit database format.
+override DEFS+=-DFORCE_64BIT
 
 # -------------------------
 #  no configuration below
@@ -52,16 +55,16 @@ haar.le.o :
 .ALWAYS:
 
 ifeq (${IMG_LIB},GD)
-IMG_libs = $(shell gdlib-config --ldflags; gdlib-config --libs)
+IMG_libs = -lgd $(shell gdlib-config --ldflags; gdlib-config --libs)
 IMG_flags = $(shell gdlib-config --cflags)
 IMG_objs = resizer.o
-DEFS+=-DLIB_GD
+override DEFS+=-DLIB_GD
 else
 ifeq (${IMG_LIB}, ImageMagick)
 IMG_libs = $(shell pkg-config --libs ImageMagick)
 IMG_flags = $(shell pkg-config --cflags ImageMagick)
 IMG_objs =
-DEFS+=-DLIB_ImageMagick
+override DEFS+=-DLIB_ImageMagick
 else
 $(error Unsupported image library '${IMG_LIB}' selected.)
 endif

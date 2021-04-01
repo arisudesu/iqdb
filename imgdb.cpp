@@ -68,6 +68,12 @@ static size_t pageImgMask = 0;
 
 /* Endianness */
 #if CONV_LE && (__BIG_ENDIAN__ || _BIG_ENDIAN || BIG_ENDIAN)
+#define CONV_ENDIAN 1
+#else
+#define CONV_ENDIAN 0
+#endif
+
+#if CONV_ENDIAN
 #define FLIP(x) flip_endian(x)
 #define FLIPPED(x) flipped_endian(x)
 #else
@@ -477,7 +483,7 @@ void dbSpaceCommon::sigFromImage(Image* image, imageId id, ImgData* sig) {
 }
 
 template<typename B>
-inline void dbSpaceCommon::bucket_set<B>::add(const ImgData& nsig, size_t index) {
+inline void dbSpaceCommon::bucket_set<B>::add(const ImgData& nsig, count_t index) {
 	lumin_int avgl;
 	SigStruct::avglf2i(nsig.avglf, avgl);
 	for (int i = 0; i < NUM_COEFS; i++) {	// populate buckets
@@ -663,6 +669,15 @@ void dbSpaceCommon::imgDataFromFile(const char* filename, imageId id, ImgData* i
 	sigFromImage(image, id, img);
 }
 
+void dbSpaceCommon::imgDataFromBlob(const void* data, size_t data_size, imageId id, ImgData* img) {
+	AutoExceptionInfo exception;
+	AutoImageInfo image_info;
+	AutoImage image(BlobToImage(image_info, data, data_size, &exception));
+	if (exception.severity != UndefinedException) CatchException(&exception);
+	check_image(image);
+	sigFromImage(image, id, img);
+}
+
 #elif LIB_GD
 void dbSpaceCommon::addImageBlob(imageId id, const void *blob, size_t length) {
 	if (hasImage(id)) // image already in db
@@ -684,6 +699,14 @@ void dbSpaceCommon::imgDataFromFile(const char* filename, imageId id, ImgData* i
 	sigFromImage(image, id, img);
 }
 
+void dbSpaceCommon::imgDataFromBlob(const void* data, size_t data_size, imageId id, ImgData* img) {
+	::image_info info;
+	get_image_info((const unsigned char*) data, data_size, &info);
+
+	AutoGDImage image(resize_image_data((const unsigned char*) data, data_size, NUM_PIXELS, NUM_PIXELS, true));
+	sigFromImage(image, id, img);
+}
+
 #endif
 
 void dbSpaceCommon::addImage(imageId id, const char *filename) {
@@ -697,6 +720,10 @@ void dbSpaceCommon::addImage(imageId id, const char *filename) {
 
 void dbSpace::imgDataFromFile(const char* filename, imageId id, ImgData* img) {
 	return dbSpaceCommon::imgDataFromFile(filename, id, img);
+}
+
+void dbSpace::imgDataFromBlob(const void* data, size_t data_size, imageId id, ImgData* img) {
+	return dbSpaceCommon::imgDataFromBlob(data, data_size, id, img);
 }
 
 template<>
@@ -737,7 +764,15 @@ void dbSpaceImpl<is_simple>::load(const char* filename) {
 		return;
 	}
 
-	uint version = FLIPPED(f.read<int>());
+	uint32_t v_code = FLIPPED(f.read<uint32_t>());
+	uint version;
+	uint32_t intsizes = v_code >> 8;
+
+	if (intsizes == 0) {
+		DEBUG(warnings)("Old database version.\n");
+	}
+
+	version = v_code & 0xff;
 
 	// Old version... skip its useless metadata.
 	if (version == 1) {
@@ -745,25 +780,44 @@ void dbSpaceImpl<is_simple>::load(const char* filename) {
 		f.read<int>(); f.read<int>(); f.read<int>();
 	}
 
-	if (version > SRZ_V0_7_0)
-		throw data_error("Database from a version after 0.7.0");
-	if (version != SRZ_V0_7_0)
+	if (version > SRZ_V0_9_0) {
+		throw data_error("Database from a version after 0.9.0");
+	} else if (version < SRZ_V0_7_0) {
 		return load_stream_old(f, version);
+	} else if (intsizes != SRZ_V_SZ) {
+		if (CONV_ENDIAN)
+			throw data_error("Cannot load database with both wrong endianness AND data sizes");
+		DEBUG(imgdb)("Loading db (converting data sizes)... ");
+	} else if (version == SRZ_V0_9_0) {
+		DEBUG(imgdb)("Loading db (cur ver)... ");
+	} else {
+		DEBUG(imgdb)("Loading db (old but compatible ver)... ");
+	}
 
-	DEBUG(imgdb)("Loading db (cur ver)... ");
-	size_t numImg = FLIPPED(f.read<size_t>());
-	off_t firstOff = FLIPPED(f.read<off_t>());
-	DEBUG_CONT(imgdb)(DEBUG_OUT, "has %zd images at %llx. ", numImg, (long long)firstOff);
+	int size_res =     (intsizes >>  0) & 31;
+	int size_count =   (intsizes >>  5) & 31;
+	int size_offset =  (intsizes >> 10) & 31;
+	int size_imageId = (intsizes >> 15) & 31;
+
+	count_t numImg = FLIPPED(f.read_size<count_t>(size_count));
+	offset_t firstOff = FLIPPED(f.read_size<offset_t>(size_offset));
+	DEBUG_CONT(imgdb)(DEBUG_OUT, "has %"FMT_count_t" images at %llx. ", numImg, (long long)firstOff);
 
 	// read bucket sizes and reserve space so that buckets do not
 	// waste memory due to exponential growth of std::vector
 	for (typename buckets_t::iterator itr = imgbuckets.begin(); itr != imgbuckets.end(); ++itr)
-		itr->reserve(FLIPPED(f.read<size_t>()));
+		itr->reserve(FLIPPED(f.read_size<count_t>(size_count)));
 	DEBUG_CONT(imgdb)(DEBUG_OUT, "bucket sizes done at %llx... ", (long long)firstOff);
 
 	// read IDs (for verification only)
 	AutoCleanArray<imageId> ids(numImg);
-	f.read(ids.ptr(), numImg);
+	if (sizeof(imageId) == size_imageId) {
+		f.read(ids.ptr(), numImg);
+	} else {
+		for (typename image_map::size_type k = 0; k < numImg; k++)
+			ids[k] = f.read_size<imageId>(size_imageId);
+	}
+
 	for (typename image_map::size_type k = 0; k < numImg; k++)
 		FLIP(ids[k]);
 
@@ -772,7 +826,18 @@ void dbSpaceImpl<is_simple>::load(const char* filename) {
 	if (is_simple) m_info.resize(numImg);
 	for (typename image_map::size_type k = 0; k < numImg; k++) {
 		ImgData sig;
-		f.read(&sig);
+		if (intsizes == SRZ_V_SZ) {
+			f.read(&sig);
+		} else {
+			memset(&sig, 0, sizeof(sig));
+			sig.id = f.read_size<imageId>(size_imageId);
+			f.read(&sig.sig1);
+			f.read(&sig.sig2);
+			f.read(&sig.sig3);
+			f.read(&sig.avglf);
+			sig.width = f.read_size<res_t>(size_res);
+			sig.height = f.read_size<res_t>(size_res);
+		}
 		FLIP(sig.id); FLIP(sig.width); FLIP(sig.height); FLIP(sig.avglf[0]); FLIP(sig.avglf[1]); FLIP(sig.avglf[2]);
 
 		size_t ind = m_nextIndex++;
@@ -836,24 +901,32 @@ void dbSpaceAlter::load(const char* filename) {
 		}
 		m_f->exceptions(std::fstream::badbit | std::fstream::failbit);
 
-		uint version = FLIPPED(m_f->read<uint>());
-		if (version != SRZ_V0_7_0)
+		uint32_t v_code = FLIPPED(m_f->read<uint32_t>());
+		uint version = v_code & 0xff;
+
+		if ((v_code >> 8) == 0) {
+			DEBUG(warnings)("Old database version.\n");
+		} else if ((v_code >> 8) != SRZ_V_SZ) {
+			throw data_error("Database incompatible with this system");
+		}
+
+		if (version != SRZ_V0_7_0 && version != SRZ_V0_9_0)
 			throw data_error("Only current version is supported in alter mode, upgrade first using normal mode.");
 
 		DEBUG(imgdb)("Loading db header (cur ver)... ");
 		m_hdrOff = m_f->tellg();
-		size_t numImg = FLIPPED(m_f->read<size_t>());
-		m_sigOff = FLIPPED(m_f->read<off_t>());
+		count_t numImg = FLIPPED(m_f->read<count_t>());
+		m_sigOff = FLIPPED(m_f->read<offset_t>());
 
-		DEBUG_CONT(imgdb)(DEBUG_OUT, "has %zd images. ", numImg);
+		DEBUG_CONT(imgdb)(DEBUG_OUT, "has %"FMT_count_t" images. ", numImg);
 		// read bucket sizes
 		for (buckets_t::iterator itr = m_buckets.begin(); itr != m_buckets.end(); ++itr)
-			itr->size = FLIPPED(m_f->read<size_t>());
+			itr->size = FLIPPED(m_f->read<count_t>());
 
 		// read IDs
 		m_imgOff = m_f->tellg();
 		for (size_t k = 0; k < numImg; k++)
-			m_images[FLIPPED(m_f->read<size_t>())] = k;
+			m_images[FLIPPED(m_f->read<count_t>())] = k;
 
 		m_rewriteIDs = false;
 		DEBUG_CONT(imgdb)(DEBUG_OUT, "complete!\n");
@@ -1079,24 +1152,24 @@ void dbSpaceImpl<false>::save_file(const char* filename) {
 	if (!f.is_open()) throw io_error(std::string("Cannot open temp file ")+temp+" for writing: "+strerror(errno));
 
 	if (is_disk_db) DEBUG_CONT(imgdb)(DEBUG_OUT, "map size: %lld... ", (long long int) lseek(imgbuckets[0][0][0].fd(), 0, SEEK_CUR));
-	f.write<int>(SRZ_V0_7_0);
-	f.write(m_images.size());
+	f.write<int32_t>(SRZ_V_CODE);
+	f.write<count_t>(m_images.size());
 	off_t firstOff = f.tellp();
 	firstOff += m_images.size() * sizeof(imageId);	// cur pos plus imageId per image
-	firstOff += imgbuckets.count() * sizeof(size_t);	// plus size_t per bucket
+	firstOff += imgbuckets.count() * sizeof(count_t);	// plus size_t per bucket
 
 	// leave space for 1024 new IDs
 	firstOff = (firstOff + 1024 * sizeof(imageId));
 	DEBUG_CONT(imgdb)(DEBUG_OUT, "sig off: %llx... ", (long long int) firstOff);
-	f.write(firstOff);
+	f.write<offset_t>(firstOff);
 
 	// save bucket sizes
 	for (buckets_t::iterator itr = imgbuckets.begin(); itr != imgbuckets.end(); ++itr)
-		f.write(itr->size());
+		f.write<count_t>(itr->size());
 
 	// save IDs
 	for (imageIterator it = image_begin(); it != image_end(); it++)
-		f.write(it.id());
+		f.write<imageId>(it.id());
 
 	// skip to firstOff
 	f.seekp(firstOff);
@@ -1171,11 +1244,11 @@ void dbSpaceAlter::save_file(const char* filename) {
 
 	if (m_rewriteIDs) {
 		DEBUG_CONT(imgdb)(DEBUG_OUT, "Rewriting all IDs... ");
-		imageId_list ids(m_images.size(), ~size_t());
+		imageId_list ids(m_images.size(), ~imageId());
 		for (ImageMap::iterator itr = m_images.begin(); itr != m_images.end(); ++itr) {
 			if (itr->second >= m_images.size())
 				throw data_error("Invalid index on save.");
-			if (ids[itr->second] != ~size_t())
+			if (ids[itr->second] != ~imageId())
 				throw data_error("Duplicate index on save.");
 			ids[itr->second] = itr->first;
 		}
@@ -1189,8 +1262,10 @@ void dbSpaceAlter::save_file(const char* filename) {
 	}
 
 	DEBUG_CONT(imgdb)(DEBUG_OUT, "saving header... ");
+	m_f->seekp(0);
+	m_f->write<uint32_t>(SRZ_V_CODE);
 	m_f->seekp(m_hdrOff);
-	m_f->write(m_images.size());
+	m_f->write<count_t>(m_images.size());
 	m_f->write(m_sigOff);
 	m_f->write(m_buckets);
 

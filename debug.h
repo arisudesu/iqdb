@@ -41,6 +41,7 @@ DEF_DEBUG(iqdb,		21)
 DEF_DEBUG(connections,	7)
 DEF_DEBUG(images,	8)
 DEF_DEBUG(dupe_finder,	10)
+DEF_DEBUG(commands,	11)
 #endif
 #ifdef DEBUG_IPV6
 DEF_DEBUG(connections,	7)

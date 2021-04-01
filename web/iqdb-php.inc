@@ -78,6 +78,9 @@ function microtime_float() {
 # Ask iqdb server for images most similar to given file.
 function request_match($file, $querysrv, $options = array()) {
 	global $services;
+	global $last_request_file;
+	
+	$last_request_file = $file;
 
 	$start = microtime_float();
 	$res = array("results" => array());
@@ -91,6 +94,7 @@ function request_match($file, $querysrv, $options = array()) {
 		$res = "";
 		$query = "";
 		foreach ($querysrv as $db) {
+			if (!array_key_exists($db, $services)) return array('err' => "Service $db unknown.");
 			$srv=$services[$services[$db]];
 			$rflags = $flags;
 			if ($srv["uniqueset"]) $rflags |= 8;
@@ -315,16 +319,24 @@ function make_thumb($img, $org) {
 
 # Output list of matches as XML.
 function produce_xml($match, $thumb, $thres) {
-	global $base_url, $services;
+	global $base_urls, $services;
 
-	$thumburl="thu/".$thumb["fname"];
-	if ($thumb["cname"]) $thumburl=$thumb['cname'];
+	if ($thumb["cname"])
+		$thumburl=$base_urls[0].$thumb['cname'];
+	else if (is_array($thumb["fname"]))
+		$thumburl=$base_urls[$thumb["fname"][1]]."thu/".$thumb["fname"][0];
+	else
+		$thumburl=$base_urls[0]."thu/".$thumb["fname"];
 	echo "<matches preview='$base_url$thumburl' threshold='".$thres["minrel"]."'>\n";
 	foreach ($match as $page) {
 		if ($page['md5']) $m = '" md5="'.$page['md5'].'"';
 		else $m = '" id="'.$page['id'].'" name="'.htmlentities($page['eng']).'"';
 		if ($page['width']) $m .= ' width="'.$page['width'].'" height="'.$page['height'].'"';
-		if ($page['fname']) $m .= " preview='$base_url".htmlentities($page['fname'])."'";
+		if ($page['fname'])
+			if (is_array($page['fname']))
+				$m .= " preview='".$base_urls[$page['fname'][1]].htmlentities($page['fname'][0], ENT_QUOTES)."'";
+			else
+				$m .= " preview='$base_urls[0]".htmlentities($page['fname'], ENT_QUOTES)."'";
 		echo '<match sim="'.$page['sim'].'" service="'.$services[$page['tag']]["site"].$m;
 		if ($page['post'])
 			echo ">".$page['post']."</match>\n";

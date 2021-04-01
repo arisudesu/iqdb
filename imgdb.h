@@ -46,10 +46,10 @@ namespace imgdb {
 DB file layout.
 
 Count	Size		Content
-1	int		DB file version
-1	size_t		Number of images
-1	off_t		Offset to image signatures
-98304	size_t		Bucket sizes
+1	int32_t		DB file version and data size code
+1	count_t		Number of images
+1	offset_t	Offset to image signatures
+98304	count_t		Bucket sizes
 num_img	imageId		Image IDs
 ?	?		<unused space left for future image IDs up to above offset>
 num_img	ImgData		Image signatures
@@ -61,12 +61,41 @@ them. The file is not shrunk in anticipation of more images being added later.
 When there is no more space for image IDs in the header, a number of
 signatures are relocated from the front to the end of the file to mask space
 for new image IDs.
+
+When you need a printf statement to display a count_t, offset_t, res_t or imageId
+value, use the FMT_count_t, FMT_offset_t, FMT_res_t and FMT_imageId macros
+as format specifier, e.g. printf("%08" FMT_imageId, id).
 */
 
 // Global typedefs and consts.
-typedef unsigned long int imageId;
 typedef int32_t Score;
 typedef int64_t DScore;
+
+#ifdef FORCE_64BIT
+typedef uint64_t imageId;
+typedef uint64_t count_t;
+typedef uint64_t offset_t;
+typedef int64_t  res_t;
+
+#define __STDC_FORMAT_MACROS
+#include <inttypes.h>
+#undef __STDC_FORMAT_MACROS
+
+#define FMT_imageId PRIx64
+#define FMT_count_t PRIu64
+#define FMT_offset_t PRIu64
+#define FMT_res_t PRId64
+#else
+typedef unsigned long int imageId;
+typedef size_t count_t;
+typedef off_t offset_t;
+typedef int res_t;
+
+#define FMT_imageId "lx"
+#define FMT_count_t "zu"
+#define FMT_offset_t "llu"
+#define FMT_res_t "d"
+#endif
 
 // Exceptions.
 class base_error : public std::exception {
@@ -189,8 +218,8 @@ struct ImgData {
 	sig_t sig3;			/* Q positions with largest magnitude */
 	double avglf[3];		/* YIQ for position [0,0] */
 	/* image properties extracted when opened for the first time */
-	int width;			/* in pixels */
-	int height;			/* in pixels */
+	res_t width;			/* in pixels */
+	res_t height;			/* in pixels */
 };
 
 class dbSpace;
@@ -216,6 +245,7 @@ struct queryOpt {
 struct queryArg : public queryOpt {
 	queryArg(dbSpace* db, imageId id, unsigned int numres, int flags);
 	queryArg(const ImgData& img, unsigned int numres, int flags);
+	queryArg(const void* data, size_t data_size, unsigned int numres, int flags);
 	queryArg(const char* filename, unsigned int numres, int flags);
 
 	// Chainable modifier functions to set non-standard arguments.
@@ -264,6 +294,7 @@ public:
 
 	// Image data.
 	static void imgDataFromFile(const char* filename, imageId id, ImgData* img);
+	static void imgDataFromBlob(const void* data, size_t data_size, imageId id, ImgData* img);
 
 	// Initialize sig and avgl of the queryArg.
 	virtual void getImgQueryArg(imageId id, queryArg* query) = 0;
@@ -330,6 +361,11 @@ inline queryArg::queryArg(const ImgData& img, unsigned int nr, int fl) : queryOp
 inline queryArg::queryArg(const char* filename, unsigned int nr, int fl) : queryOpt(fl), numres(nr) {
 	ImgData img;
 	dbSpace::imgDataFromFile(filename, 0, &img);
+	dbSpace::queryFromImgData(img, this);
+}
+inline queryArg::queryArg(const void* data, size_t data_size, unsigned int nr, int fl) : queryOpt(fl), numres(nr) {
+	ImgData img;
+	dbSpace::imgDataFromBlob(data, data_size, 0, &img);
 	dbSpace::queryFromImgData(img, this);
 }
 inline queryArg& queryArg::merge(const queryOpt& q) {

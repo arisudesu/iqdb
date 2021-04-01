@@ -3,6 +3,10 @@
 use strict;
 use warnings;
 
+# Two modes of operation depending on filename.
+
+# mkdup:
+#
 # Generate a list of duplicates using iqdb.
 #
 # This script maintains an iqdb database along with a
@@ -35,6 +39,17 @@ use warnings;
 # put mkdup.cfg in the current directory, for settings
 # specific to that directory if you like.
 
+# imgSeek:
+# Mostly same as above, but using imgSeek.cfg and
+# ./imgSeek <image to search>
+#
+# Searches for matches to the given image in the DB.
+
+my $mode = substr $0, 1 + index $0, "/";
+my $imgSeek = $mode eq 'imgSeek';
+my $mkdup = $mode eq 'mkdup';
+die "Unknown mode $mode!\n" unless $imgSeek or $mkdup;
+
 our $mindev_default = 7;			# Default minimum std.deviation for a match.
 our @defdirs = ("sorted", "unsorted", "extra");	# Default directories to search.
 
@@ -46,6 +61,8 @@ our $db_file = "dupes.db";	# iqdb database file.
 our $id_file = "dupes.fdb";	# database holding filename and image ID mapping.
 our $exclude_file = "dupes.txt";# file holding images to exclude from the dupe checking.
 our $chdir = "";		# directory to change to (if not empty)
+our $chdir_out = "";		# same directory to use for the dupe output
+our $links = 0;			# set to 1 to not ignore symlinks
 
 #
 # No user-servicable parts below.
@@ -58,21 +75,27 @@ use Storable qw(store_fd fd_retrieve);
 
 our ($normalize,$endcommands);
 eval `cat $ENV{HOME}/.mkdup.rc` if -e "$ENV{HOME}/.mkdup.rc"; die "Error in ~/.mkdup.rc: $@" if $@;
-eval `cat mkdup.cfg` if -e "mkdup.cfg"; die "Error in mkdup.cfg: $@" if $@;
+eval `cat $mode.cfg` if -e "$mode.cfg"; die "Error in $mode.cfg: $@" if $@;
 
-my $mindev = shift;
+my $mindev;
+if ($mkdup) {
+$mindev = shift;
 if (!$mindev) {
 	$mindev = $mindev_default;
 	print "Minimum std.dev. not given, using $mindev%.\n";
 }
+}
 my $flags;
 my @dirs;
+my @imgs;
 
 for (@ARGV) {
 	if (/^-/) {
 		$flags .= " $_";
-	} else {
+	} elsif ($mkdup) {
 		push @dirs, $_;
+	} elsif ($imgSeek) {
+		push @imgs, $_;
 	}
 }
 @dirs = @defdirs unless @dirs;
@@ -80,7 +103,8 @@ for (@ARGV) {
 my $db_file_bak = "$db_file.bak";
 if ($chdir) {
 	chdir $chdir or die "Can't chdir to $chdir: $!\n";
-	$chdir = "$chdir/" unless $chdir =~ m#/$#;
+	$chdir = "$chdir/" unless $chdir =~ m#/$#;	## deconfuse vim
+	$chdir_out = $chdir unless $chdir_out;
 }
 
 $| = 1;
@@ -116,7 +140,7 @@ sub add {
 		$lastlen = length;
 		return;
 	}
-	if (-l) {
+	if (-l && !$links) {
 		warn "Dangling link: $_\n" unless -e;
 		return;
 	}
@@ -127,14 +151,14 @@ sub add {
 	$files{$_} = 1;
 }
 
-find { wanted => \&add, no_chdir => 1, follow => 1 }, @dirs;
+find { wanted => \&add, no_chdir => 1, follow => 1, follow_skip => 2 }, @dirs;
 
 print scalar keys %files, " files found. ", scalar keys %{$idlist->{ids}}, " IDs and ", scalar keys %{$idlist->{files}}, " files in DB.\n";
-die "No files found, aborting.\n" unless %{$idlist->{ids}};
+warn "No files found in DB.\n" unless %{$idlist->{ids}};
 
-print "Redirecting stderr to mkdup.err.\n";
+print "Redirecting stderr to $mode.err.\n";
 open my $old_stderr, ">&STDERR" or die "Can't dup stderr: $!\n";
-open STDERR, ">", "mkdup.err" or die "Can't write mkdup.err: $!\n";
+open STDERR, ">", "$mode.err" or die "Can't write $mode.err: $!\n";
 
 # tee iqdb.cmd|
 open my $iqdb, "|-", "iqdb command $db_file".q(|perl -ne 'BEGIN{$|=1;}next if /^000/ or /duplicate_id/;print "\n" if /^3/;s/\\n$/\\r/ if /^100/;print') or die "Can't run iqdb: $!\n";
@@ -226,10 +250,12 @@ unlink "iqdb.cmd";
 
 open STDERR, ">&", $old_stderr or die "Can't reopen old stderr: $!\n";
 
-print "Getting dupe list...\n";
 for my $k (keys %{$idlist->{files}}) {
 	$idlist->{ids}{$idlist->{files}{$k}} = $k;
 }
+
+if ($mkdup) {
+print "Getting dupe list...\n";
 open $iqdb, "-|", "iqdb", "find_duplicates", $db_file, $mindev or die "Can't run iqdb: $!\n";
 open my $dupes, ">", "$ENV{HOME}/.gqview/collections/duplicates.gqv" or die "Can't write duplicates: $!\n";
 
@@ -252,12 +278,38 @@ while (<$iqdb>) {
 			next;
 		}
 		warn "$_ in duplicate list but not file DB\n" and next unless exists $idlist->{ids}{$_};
-		print $dupes qq("$chdir$idlist->{ids}{$_}"\n);
+		print $dupes qq("$chdir_out$idlist->{ids}{$_}"\n);
 	}
 }
 
 close $iqdb or die "Can't close iqdb: $!\n";
 close $dupes or die "Can't close dupes: $!\n";
 print "$dupecnt dupes in $groupcnt groups.\n";
+}
+if ($imgSeek and @imgs) {
+for (@imgs) { die "Not a file: $_\n" unless -f };
+open my $dupes, ">", "$ENV{HOME}/.gqview/collections/duplicates.gqv" or die "Can't write duplicates: $!\n";
+my $commands = "load 0 simple $db_file\\n" . join "", (map "query 0 0 16 $_\n", @imgs), "done now\\n";
+open $iqdb, "echo -e '$commands'|iqdb command|" or die "Can't run iqdb: $!\n";
+while(<$iqdb>) { last if /^000 /; }
+while(<$iqdb>) { last if /^000 /; }
+while(@imgs) {
+print "Finding matches to $imgs[0]...\n";
+print $dupes qq("$imgs[0]"\n);
+while (<$iqdb>) {
+	chomp;
+	if (/^3/) { print "$_\n"; shift @imgs; last; }
+	if (/^000 /) { shift @imgs; last; }
+	warn "Reply $_ not understood\n" and next unless /^200 ([0-9a-f]+) ([0-9+-.]+) (\d+) (\d+)$/;
+	#my $id = hex $1;
+	print $dupes qq(# Similarity $2\n);
+	warn "$_ in duplicate list but not file DB\n" and next unless exists $idlist->{ids}{$1};
+	print $dupes qq("$chdir_out$idlist->{ids}{$1}"\n);
+}
+}
+
+close $iqdb or die "Can't close iqdb: $!\n";
+close $dupes or die "Can't close dupes: $!\n";
+}
 
 $endcommands->() if $endcommands;

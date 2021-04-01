@@ -1,14 +1,29 @@
+iqdb-20090612:
+- add imgseek mode to dupe finder script that searches for a
+  given image file in the dupe database
+- fix wrong transparent png background color
+- add int size and endianness check
+- some minor fixes to allow it to compile on Debian Lenny
+- add platform-independent 64bit DB file mode and make it the default
+- auto-convert on load if int sizes don't match, see README
+  for details on how to do a permanent conversion to 64bit mode
+- allow querying by image data literal (instead of filename)
+- allow limiting iqdb queries to a few IP addresses using
+  -s <IP/hostname> (can be given multiple times)
+- allow to return only relevant results that exceed a minimum
+  standard deviation, set using "queryopt mindev <min.std.dev.>"
+- report number of results that follow for every query, using
+  a "101 matches=<number>" reply
+- allow setting debug level at start with -d and while running
+  with the "debuglevel <level>" command
+
 iqdb-20081123:
 - make it compile with g++ 4.3.x
-- add query_opt that allows limiting search results by a
-  bitmask (e.g. to only return images of a certain rating)
 - add maintenance commands to list, load, save and drop databases
   without restarting the server
 - listen mode can now listen on two sockets, only one of which
   supports maintenance commands, and whose pending requests will
   be serviced before those on the other (low priority) socket
-- changed PHP code to retrieve info for all MD5's on one DB in
-  a single mysql query
 - make it compile on *BSD (missing include)
 - fix crash in delta_queue (ungodly memory consumption)
   on 64bit platforms

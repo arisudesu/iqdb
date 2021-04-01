@@ -415,7 +415,7 @@ void AutoPNG::read_info() {
 }
 
 png_color_16 AutoPNG::white_background
-	= { index: 0, red: ~png_uint_16(), green: png_uint_16(), blue: ~png_uint_16(), gray: ~png_uint_16() };
+	= { index: 0, red: ~png_uint_16(), green: ~png_uint_16(), blue: ~png_uint_16(), gray: ~png_uint_16() };
 
 void AutoPNG::setup_trans() {
 	png_set_palette_to_rgb(png);
@@ -599,7 +599,7 @@ gdImagePtr resize_png(const unsigned char* data, size_t len, const image_info* i
 	return img.detach();
 }
 
-gdImagePtr resize_image_data(const unsigned char* data, size_t len, unsigned int thu_x, unsigned int thu_y, bool allow_prescaled) {
+resizer_result resize_image_data(const unsigned char* data, size_t len, unsigned int thu_x, unsigned int thu_y, bool allow_prescaled) {
 	image_info info;
 	get_image_info(data, len, &info);
 
@@ -664,6 +664,6 @@ gdImagePtr resize_image_data(const unsigned char* data, size_t len, unsigned int
 	DEBUG(terse)("Resized %s %d x %d via %d x %d to %d x %d.\n", info.mime_type, info.width, info.height, img->sx, img->sy, thu_x, thu_y);
 
 	// Stop autocleaning thu, and return its value instead.
-	return thu.detach();
+	return resizer_result(thu.detach(), img->sx, img->sy);
 }
 
