@@ -31,6 +31,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <ctime> 
+#include <limits>
 
 /* STL includes */
 #include <algorithm>
@@ -39,6 +40,9 @@
 /* iqdb includes */
 #include "imgdb.h"
 #include "imglib.h"
+#include "debug.h"
+
+extern int debug_level;
 
 namespace imgdb {
 
@@ -101,7 +105,7 @@ mapped_file::mapped_file(const char* fname, bool writable) {
 inline void mapped_file::unmap() {
 	if (!m_base) return;
 	if (munmap(m_base, m_length))
-		fprintf(stderr, "WARNING: Could not unmap %zd bytes of memory.\n", m_length);
+		DEBUG(errors)("WARNING: Could not unmap %zd bytes of memory.\n", m_length);
 }
 
 int tempfile() {
@@ -109,7 +113,7 @@ int tempfile() {
 	int fd = mkstemp(tempnam);
 	if (fd == -1) throw io_error(std::string("Can't open cache file ")+tempnam+": "+strerror(errno));
 	if (unlink(tempnam))
-		fprintf(stderr, "WARNING: Can't unlink cache file %s: %s.", tempnam, strerror(errno));
+		DEBUG(errors)("WARNING: Can't unlink cache file %s: %s.", tempnam, strerror(errno));
 	return fd;
 }
 
@@ -221,7 +225,7 @@ void imageIdIndex_list<is_simple, false>::page_out() {
 //fprintf(stderr, "Only fits %zd, %zd left = %zd.\n", copy, m_tail.size(), size());
 	}
 	if (munmap(ptr, pageSize))
-		fprintf(stderr, "WARNING: Failed to munmap tail page.\n");
+		DEBUG(errors)("WARNING: Failed to munmap tail page.\n");
 }
 
 template<>
@@ -274,6 +278,21 @@ void imageIdIndex_list<true, true>::set_base() {
 #else
 	m_base.swap(m_tail);
 #endif
+}
+
+int dbSpace::mode_from_name(const char* mode_name) {
+	if (!strcmp(mode_name, "normal"))
+		return imgdb::dbSpace::mode_normal;
+	else if (!strcmp(mode_name, "readonly"))
+		return imgdb::dbSpace::mode_readonly;
+	else if (!strcmp(mode_name, "simple"))
+		return imgdb::dbSpace::mode_simple;
+	else if (!strcmp(mode_name, "alter"))
+		return imgdb::dbSpace::mode_alter;
+	else if (!strcmp(mode_name, "imgdata"))
+		return imgdb::dbSpace::mode_imgdata;
+	else
+		throw param_error("Unknown mode name.");
 }
 
 // Specializations accessing images as SigStruct* or size_t map, and imageIdIndex_map as imageId or index map.
@@ -714,7 +733,7 @@ template<bool is_simple>
 void dbSpaceImpl<is_simple>::load(const char* filename) {
 	db_ifstream f(filename);
 	if (!f.is_open()) {
-		fprintf(stderr, "ERROR: unable to open file %s for read ops: %s.\n", filename, strerror(errno));
+		DEBUG(warnings)("Unable to open file %s for read ops: %s.\n", filename, strerror(errno));
 		return;
 	}
 
@@ -731,16 +750,16 @@ void dbSpaceImpl<is_simple>::load(const char* filename) {
 	if (version != SRZ_V0_7_0)
 		return load_stream_old(f, version);
 
-fprintf(stderr, "Loading db (cur ver)... ");
+	DEBUG(imgdb)("Loading db (cur ver)... ");
 	size_t numImg = FLIPPED(f.read<size_t>());
 	off_t firstOff = FLIPPED(f.read<off_t>());
-fprintf(stderr, "has %zd images at %llx. ", numImg, (long long)firstOff);
+	DEBUG_CONT(imgdb)(DEBUG_OUT, "has %zd images at %llx. ", numImg, (long long)firstOff);
 
 	// read bucket sizes and reserve space so that buckets do not
 	// waste memory due to exponential growth of std::vector
 	for (typename buckets_t::iterator itr = imgbuckets.begin(); itr != imgbuckets.end(); ++itr)
 		itr->reserve(FLIPPED(f.read<size_t>()));
-fprintf(stderr, "bucket sizes done at %llx... ", (long long)firstOff);
+	DEBUG_CONT(imgdb)(DEBUG_OUT, "bucket sizes done at %llx... ", (long long)firstOff);
 
 	// read IDs (for verification only)
 	AutoCleanArray<imageId> ids(numImg);
@@ -759,11 +778,14 @@ fprintf(stderr, "bucket sizes done at %llx... ", (long long)firstOff);
 		size_t ind = m_nextIndex++;
 		imgbuckets.add(sig, ind);
 
-		if (ids[ind] != sig.id)
-			if (is_simple)
-				fprintf(stderr, "\nWARNING: index %zd DB header ID %08llx mismatch with sig ID %08llx.", ind, (long long)ids[ind], (long long) sig.id);
-			else
+		if (ids[ind] != sig.id) {
+			if (is_simple) {
+				DEBUG_CONT(imgdb)(DEBUG_OUT, "\n");
+				DEBUG(warnings)("WARNING: index %zd DB header ID %08llx mismatch with sig ID %08llx.", ind, (long long)ids[ind], (long long) sig.id);
+			} else {
 				throw data_error("DB header ID mismatch with sig ID.");
+			}
+		}
 
 		if (is_simple) {
 			m_info[ind].id = sig.id;
@@ -789,14 +811,13 @@ fprintf(stderr, "bucket sizes done at %llx... ", (long long)firstOff);
 		}
 	}
 
-	if (is_simple) {
-if (is_disk_db) fprintf(stderr, "map size: %lld... ", (long long int) lseek(imgbuckets[0][0][0].fd(), 0, SEEK_CUR));
-	}
+	if (is_simple && is_disk_db)
+		DEBUG_CONT(imgdb)(DEBUG_OUT, "map size: %lld... ", (long long int) lseek(imgbuckets[0][0][0].fd(), 0, SEEK_CUR));
 
 	for (typename buckets_t::iterator itr = imgbuckets.begin(); itr != imgbuckets.end(); ++itr)
 		itr->set_base();
 	m_bucketsValid = true;
-fprintf(stderr, "complete!\n");
+	DEBUG_CONT(imgdb)(DEBUG_OUT, "complete!\n");
 	f.close();
 }
 
@@ -819,12 +840,12 @@ void dbSpaceAlter::load(const char* filename) {
 		if (version != SRZ_V0_7_0)
 			throw data_error("Only current version is supported in alter mode, upgrade first using normal mode.");
 
-fprintf(stderr, "Loading db header (cur ver)... ");
+		DEBUG(imgdb)("Loading db header (cur ver)... ");
 		m_hdrOff = m_f->tellg();
 		size_t numImg = FLIPPED(m_f->read<size_t>());
 		m_sigOff = FLIPPED(m_f->read<off_t>());
 
-fprintf(stderr, "has %zd images. ", numImg);
+		DEBUG_CONT(imgdb)(DEBUG_OUT, "has %zd images. ", numImg);
 		// read bucket sizes
 		for (buckets_t::iterator itr = m_buckets.begin(); itr != m_buckets.end(); ++itr)
 			itr->size = FLIPPED(m_f->read<size_t>());
@@ -835,13 +856,14 @@ fprintf(stderr, "has %zd images. ", numImg);
 			m_images[FLIPPED(m_f->read<size_t>())] = k;
 
 		m_rewriteIDs = false;
-fprintf(stderr, "complete!\n");
+		DEBUG_CONT(imgdb)(DEBUG_OUT, "complete!\n");
 	} catch (const base_error& e) {
 		if (m_f) {
 			if (m_f->is_open()) m_f->close();
 			delete m_f;
 			m_fname.clear();
 		}
+		DEBUG_CONT(imgdb)(DEBUG_OUT, "failed!\n");
 		throw;
 	}
 }
@@ -857,7 +879,7 @@ void dbSpaceImpl<false>::load_stream_old(db_ifstream& f, uint version) {
 	throw data_error("Cannot load old database version: NO_SUPPORT_OLD_VER was set.");
 #else
 	static const bool is_simple = false;
-fprintf(stderr, "Loading db (old ver)... ");
+	DEBUG(imgdb)("Loading db (old ver)... ");
 
 	imageId id;
 	uint sz;	
@@ -876,7 +898,7 @@ fprintf(stderr, "Loading db (old ver)... ");
 		if (sz == ~uint()) {
 			if (itr != imgbuckets.begin()) throw data_error("No-bucket indicator too late.");
 				m_bucketsValid = false;
-fprintf(stderr, "NO BUCKETS VERSION! ");
+			DEBUG_CONT(imgdb)(DEBUG_OUT, "NO BUCKETS VERSION! ");
 			sz = FLIPPED(f.read<int>());
 		}
 		if (m_bucketsValid)
@@ -886,7 +908,7 @@ fprintf(stderr, "NO BUCKETS VERSION! ");
 	f.read((char *) &(szt), sizeof(szt));
 	FLIP(szt);
 	f.seekg(old_pos);
-fprintf(stderr, "has %zd images. ", szt);
+	DEBUG_CONT(imgdb)(DEBUG_OUT, "has %zd images. ", szt);
 	//To discard most common buckets: szt /= 10;
 
 	// read buckets
@@ -930,13 +952,13 @@ fprintf(stderr, "has %zd images. ", szt);
 //fprintf(stderr, "Bucket has %zd capacity paged, %zd in pages, %zd in tail.\n", bucket.paged_capacity(), bucket.paged_size(), bucket.tail_size());
 //fprintf(stderr, "Done.\n");
 	}
-fprintf(stderr, "buckets done... ");
+	DEBUG_CONT(imgdb)(DEBUG_OUT, "buckets done... ");
 
 	// read sigs
 	f.read((char *) &(szt), sizeof(szt));
 	FLIP(szt);
-fprintf(stderr, "%zd images... ", szt);
-if (version == SRZ_V0_6_0) fprintf(stderr, "converting from v6.0... ");
+	DEBUG_CONT(imgdb)(DEBUG_OUT, "%zd images... ", szt);
+	if (version == SRZ_V0_6_0) DEBUG_CONT(imgdb)(DEBUG_OUT, "converting from v6.0... ");
 
 	if (is_simple) m_info.resize(szt);
 
@@ -1012,14 +1034,13 @@ if (version == SRZ_V0_6_0) fprintf(stderr, "converting from v6.0... ");
 			*/
 		}
 
-	if (is_simple) {
-if (is_disk_db) fprintf(stderr, "map size: %lld... ", (long long int) lseek(imgbuckets[0][0][0].fd(), 0, SEEK_CUR));
-	}
+	if (is_simple && is_disk_db)
+		DEBUG_CONT(imgdb)(DEBUG_OUT, "map size: %lld... ", (long long int) lseek(imgbuckets[0][0][0].fd(), 0, SEEK_CUR));
 
 	for (buckets_t::iterator itr = imgbuckets.begin(); itr != imgbuckets.end(); ++itr)
 		itr->set_base();
 	m_bucketsValid = true;
-fprintf(stderr, "complete!\n");
+	DEBUG_CONT(imgdb)(DEBUG_OUT, "complete!\n");
 	f.close();
 #endif
 }
@@ -1052,12 +1073,12 @@ void dbSpaceImpl<false>::save_file(const char* filename) {
 	then follow image signatures, see struct ImgData
 	 */
 
-fprintf(stderr, "Saving to %s... ", filename);
+	DEBUG(imgdb)("Saving to %s... ", filename);
 	std::string temp = std::string(filename) + ".temp";
 	db_ofstream f(temp.c_str());
 	if (!f.is_open()) throw io_error(std::string("Cannot open temp file ")+temp+" for writing: "+strerror(errno));
 
-if (is_disk_db) fprintf(stderr, "map size: %lld... ", (long long int) lseek(imgbuckets[0][0][0].fd(), 0, SEEK_CUR));
+	if (is_disk_db) DEBUG_CONT(imgdb)(DEBUG_OUT, "map size: %lld... ", (long long int) lseek(imgbuckets[0][0][0].fd(), 0, SEEK_CUR));
 	f.write<int>(SRZ_V0_7_0);
 	f.write(m_images.size());
 	off_t firstOff = f.tellp();
@@ -1066,7 +1087,7 @@ if (is_disk_db) fprintf(stderr, "map size: %lld... ", (long long int) lseek(imgb
 
 	// leave space for 1024 new IDs
 	firstOff = (firstOff + 1024 * sizeof(imageId));
-fprintf(stderr, "sig off: %llx... ", (long long int) firstOff);
+	DEBUG_CONT(imgdb)(DEBUG_OUT, "sig off: %llx... ", (long long int) firstOff);
 	f.write(firstOff);
 
 	// save bucket sizes
@@ -1080,7 +1101,7 @@ fprintf(stderr, "sig off: %llx... ", (long long int) firstOff);
 	// skip to firstOff
 	f.seekp(firstOff);
 
-fprintf(stderr, "sigs... ");
+	DEBUG_CONT(imgdb)(DEBUG_OUT, "sigs... ");
 	// save sigs
 	for (imageIterator it = image_begin(); it != image_end(); it++) {
 		ImgData dsig;
@@ -1089,7 +1110,7 @@ fprintf(stderr, "sigs... ");
 	}
 	f.close();
 	if (rename(temp.c_str(), filename)) throw io_error(std::string("Cannot rename temp file ")+temp+" to DB file "+filename+": "+strerror(errno));
-fprintf(stderr, "done!\n");
+	DEBUG_CONT(imgdb)(DEBUG_OUT, "done!\n");
 }
 
 template<> void dbSpaceImpl<true>::save_file(const char* filename) { throw usage_error("Can't save read-only db."); }
@@ -1144,12 +1165,12 @@ void dbSpaceAlter::save_file(const char* filename) {
 	if (filename && m_fname != filename)
 		throw param_error("Cannot save to different filename.");
 
-fprintf(stderr, "saving file, %zd deleted images... ", m_deleted.size());
+	DEBUG(imgdb)("saving file, %zd deleted images... ", m_deleted.size());
 	if (!m_deleted.empty())
 		move_deleted();
 
 	if (m_rewriteIDs) {
-fprintf(stderr, "Rewriting all IDs... ");
+		DEBUG_CONT(imgdb)(DEBUG_OUT, "Rewriting all IDs... ");
 		imageId_list ids(m_images.size(), ~size_t());
 		for (ImageMap::iterator itr = m_images.begin(); itr != m_images.end(); ++itr) {
 			if (itr->second >= m_images.size())
@@ -1167,13 +1188,13 @@ fprintf(stderr, "Rewriting all IDs... ");
 		m_rewriteIDs = false;
 	}
 
-fprintf(stderr, "saving header... ");
+	DEBUG_CONT(imgdb)(DEBUG_OUT, "saving header... ");
 	m_f->seekp(m_hdrOff);
 	m_f->write(m_images.size());
 	m_f->write(m_sigOff);
 	m_f->write(m_buckets);
 
-fprintf(stderr, "done!\n");
+	DEBUG_CONT(imgdb)(DEBUG_OUT, "done!\n");
 	m_f->flush();
 }
 
@@ -1186,21 +1207,21 @@ void dbSpaceAlter::resize_header() {
 
   // make space for 1024 new IDs
   size_t numrel = (1024 * sizeof(imageId) + sizeof(ImgData) - 1) / sizeof(ImgData);
-fprintf(stderr, "relocating %zd/%zd images... from %llx ", numrel, m_images.size(), (long long int) m_sigOff);
+  DEBUG(imgdb)("relocating %zd/%zd images... from %llx ", numrel, m_images.size(), (long long int) m_sigOff);
   if (m_images.size() < numrel) throw internal_error("dbSpaceAlter::resize_header called with too few images!");
   ImgData sigs[numrel];
   m_f->seekg(m_sigOff);
   m_f->read(sigs, numrel);
   off_t writeOff = m_sigOff + m_images.size() * sizeof(ImgData);
   m_sigOff = m_f->tellg();
-fprintf(stderr, "to %llx (new off %llx) ", (long long int) writeOff, (long long int) m_sigOff);
+  DEBUG_CONT(imgdb)(DEBUG_OUT, "to %llx (new off %llx) ", (long long int) writeOff, (long long int) m_sigOff);
   m_f->seekp(writeOff);
   m_f->write(sigs, numrel);
 
   size_t addrel = m_images.size() - numrel;
   for (ImageMap::iterator itr = m_images.begin(); itr != m_images.end(); ++itr)
     itr->second = (itr->second >= numrel ? itr->second - numrel : itr->second + addrel);
-fprintf(stderr, "done.\n");
+  DEBUG_CONT(imgdb)(DEBUG_OUT, "done.\n");
 
   m_rewriteIDs = true;
 }
@@ -1355,13 +1376,13 @@ sim_vector dbSpaceImpl<is_simple>::do_query(queryArg q) {
 #if QUERYSTATS
 	size_t num = 0;
 	for (size_t i = 0; i < sizeof(setcnt)/sizeof(setcnt[0]); i++) num += setcnt[i];
-	fprintf(stderr, "Query complete, coefcnt=%zd coeflen=%zd coefmax=%zd numset=%zd/%zd\nCounts: ", coefcnt, coeflen, coefmax, num, m_images.size());
+	DEBUG(imgdb)("Query complete, coefcnt=%zd coeflen=%zd coefmax=%zd numset=%zd/%zd\nCounts: ", coefcnt, coeflen, coefmax, num, m_images.size());
 	num = 0;
 	for (size_t i = sizeof(setcnt)/sizeof(setcnt[0]) - 1; i > 0 && num < 10; i--) if (setcnt[i]) {
 		num++;
-		fprintf(stderr, "%zd=%zd; ", i, setcnt[i]);
+		DEBUG_CONT(imgdb)(DEBUG_OUT, "%zd=%zd; ", i, setcnt[i]);
 	}
-	fprintf(stderr, "\n");
+	DEBUG_CONT(imgdb)(DEBUG_OUT, "\n");
 	/*\
 	|* Results:
 	|* coefcnt=120  coeflen ~ 20*numimg  coefmax ~ numimg/2  numset > 99.99%

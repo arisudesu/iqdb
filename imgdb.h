@@ -24,6 +24,7 @@
 #ifndef IMGDBASE_H
 #define IMGDBASE_H
 
+#include <string.h>
 #include <math.h>
 
 // STL includes
@@ -78,7 +79,7 @@ protected:
 	base_error(const char* what, const char* type) throw() : m_what(what), m_type(type), m_str(NULL) { }
 	explicit base_error(const std::string& what, const char* type) throw()
 		: m_what(NULL), m_type(type), m_str(new std::string(what)) { }
-private:
+
 	const char* m_what;
 	const char* m_type;
 	std::string* m_str;
@@ -122,6 +123,13 @@ public:
 
 private:
 	int m_code;
+};
+
+// and also a text
+class io_errno_desc : public io_errno {
+public:
+	io_errno_desc(int code, const char* what) throw() : io_errno(code) { m_what = what; }
+	const char* more() const throw() { return m_what; }
 };
 
 const Score ScoreScale = 20;
@@ -243,6 +251,8 @@ public:
 	// Used internally.
 	static const int flags_internal	= 0xff000000;
 	static const int flag_mask	= 0x10000000;	// Use AND and XOR masks, and only return image if result is zero.
+
+	static int         mode_from_name(const char* mode);
 
 	static dbSpace*    load_file(const char* filename, int mode);
 	virtual void       save_file(const char* filename) = 0;

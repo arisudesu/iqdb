@@ -117,7 +117,11 @@ function request_match($file, $querysrv, $options = array()) {
 	$start = microtime_float();
 	$result = array("values" => $res["values"], "match" => array());
 
+	$args = array();
+	$resnum = -1;
+	$out = array();
 	foreach ($res["results"] as $line) {
+		$resnum++;
 		list($dbid,$id,$sim,$width,$height) = split(" ", $line);
 		if (!$width) $width=-1;
 		if (!$height) $height=-1;
@@ -126,11 +130,8 @@ function request_match($file, $querysrv, $options = array()) {
 
 		$srv = $services[$services[$dbid]];
 		if ($srv["process"]) {
-			$arg = array("dbid" => $dbid, "id" => $id, "sim" => $sim, "width" => $width, "height" => $height, "file" => $file);
-			$match = $srv["process"]($arg);
-			if (!is_array($match)) continue;
-			if ($match["err"]) return array('err' => $match["err"]);
-			array_push($result["match"], $match);
+			$arg = array("dbid" => $dbid, "id" => hexdec($id), "sim" => $sim, "width" => $width, "height" => $height, "file" => $file, "resnum" => $resnum);
+			$args[$dbid][] = $arg;
 			continue;
 		}
 
@@ -143,8 +144,27 @@ function request_match($file, $querysrv, $options = array()) {
 		#debug("result: $line. ID:$id Pref:$pref sim:$sim files:".join(";",$files));
 		if (count($files) != 1) continue;
 		if (!ereg("/(".$srv["dir"]."/[0-9a-fx\/]+/([0-9a-f-]+)\.jpg)$", $files[0], $eres)) continue;
-		array_push($result["match"], array('sim' => $sim, 'md5' => substr($eres[2],-32), 'fname' => $eres[1], 'tag' => $srv["dir"], 'width' => $width, 'height' => $height));
+		$out[$resnum] = array('sim' => $sim, 'md5' => substr($eres[2],-32), 'fname' => $eres[1], 'tag' => $srv["dir"], 'width' => $width, 'height' => $height);
 	}
+	foreach ($args as &$arg) {
+		$tag = $services[$arg[0]["dbid"]];
+		#debug("Querying $tag for ".count($arg)." IDs");
+		$matches = $services[$services[$arg[0]["dbid"]]]["process"]($arg);
+		if (!is_array($matches)) continue;
+		if ($matches["err"]) return array('err' => $matches["err"]);
+		$argnums = array();
+		for ($argnum = 0; $argnum < count($arg); $argnum++) $argnums["".$arg[$argnum]["id"]] = $argnum;
+		#$debout="";foreach($argnums as $key => $value)$debout.=" $key:$value";debug("Using arg inds$debout");
+		foreach ($matches as &$match) {
+			$argnum = $argnums[$match["id"]];
+			#debug("Result for id ".$match['id']." is arg #$arg and result #".$arg[$argnum]["resnum"]." i.e. id ".$arg[$argnum]["id"]." sim=".$arg[$argnum]["sim"]);
+			$match['tag'] = $tag;
+			$match['sim'] = $arg[$argnum]["sim"];
+			$out[$arg[$argnum]["resnum"]] = $match;
+		}
+	}
+	for($i=0; $i<=$resnum; $i++) $result["match"][] = $out[$i];
+	#$debout="";foreach ($result["match"] as $key => $val)$debout.=" $key:".$val["id"]."=".$val["sim"];debug("Sims:$debout");
 	$dbtime = microtime_float() - $start;
 	#debug("Got ".count($res["results"])." results parsed into ".count($result["match"])." matches.");
 	if (count($res["results"]) && !count($result["match"])) return array('err' => "Thumbnails not found or search returned no results.");

@@ -38,6 +38,8 @@ extern "C" {
 #include "imgdb.h"
 #include "resizer.h"
 
+extern int debug_level;
+
 inline int get_jpeg_info(const unsigned char* data, size_t length, image_info* info) {
 	while (1) {
 		if (data[0] != 0xff || data[1] < 0xc0) {
@@ -659,7 +661,7 @@ gdImagePtr resize_image_data(const unsigned char* data, size_t len, unsigned int
 	if ((unsigned int)img->sx == thu_x && (unsigned int)img->sy == thu_y) return img.detach();
 
 	gdImageCopyResampled(thu, img, 0, 0, 0, 0, thu_x, thu_y, img->sx, img->sy);
-	DEBUG(summary)("Resized %s %d x %d via %d x %d to %d x %d.\n", info.mime_type, info.width, info.height, img->sx, img->sy, thu_x, thu_y);
+	DEBUG(terse)("Resized %s %d x %d via %d x %d to %d x %d.\n", info.mime_type, info.width, info.height, img->sx, img->sy, thu_x, thu_y);
 
 	// Stop autocleaning thu, and return its value instead.
 	return thu.detach();

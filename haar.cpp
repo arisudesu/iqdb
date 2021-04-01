@@ -49,6 +49,7 @@
 #include <math.h> 
 #include <stdio.h> 
 #include <stdlib.h> 
+#include <string.h>
 
 /* imgSeek Includes */
 #include "haar.h"

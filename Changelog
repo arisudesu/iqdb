@@ -1,3 +1,18 @@
+iqdb-20081123:
+- make it compile with g++ 4.3.x
+- add query_opt that allows limiting search results by a
+  bitmask (e.g. to only return images of a certain rating)
+- add maintenance commands to list, load, save and drop databases
+  without restarting the server
+- listen mode can now listen on two sockets, only one of which
+  supports maintenance commands, and whose pending requests will
+  be serviced before those on the other (low priority) socket
+- changed PHP code to retrieve info for all MD5's on one DB in
+  a single mysql query
+- make it compile on *BSD (missing include)
+- fix crash in delta_queue (ungodly memory consumption)
+  on 64bit platforms
+
 iqdb-20080718:
 - support GD for image loading and resizing
   (it's the default now, edit the Makefile if you prefer ImageMagick)
@@ -9,6 +24,8 @@ iqdb-20080718:
 - allow using custom routines for microtime_float, thumb_fname, make_thumb
   and request_srv in the PHP code, if you need to do things a little, but
   not completely, differently
+- added sample code showing how to use CurlTransfer for URL
+  transfers with status updates
 
 iqdb-20080612:
 - optimized delta_iterator to improve query speed by ~20%

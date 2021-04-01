@@ -3,6 +3,8 @@
 // it needs a readable image in test.jpg to run.
 // If it runs without throwing any exceptions, it all works fine!
 
+#include <stdlib.h>
+#include <stdio.h>
 #include <tr1/unordered_map>
 #include "delta_queue.h"
 #include "debug.h"
@@ -205,7 +207,7 @@ int main() {
 	db = imgdb::dbSpace::load_file(fn, imgdb::dbSpace::mode_simple);
 	fprintf(stderr, "Querying... ");
 	query(db, 1, removed); query(db, 314, removed); query(db, 2101, removed); query(db, 2000, removed);
-	for (int i = 1; i < 50; i++) query(db, 1 + random() % 2101, removed);
+	for (int i = 1; i < 50; i++) query(db, 1 + rand() % 2101, removed);
 	fprintf(stderr, "\nOK. Adding/querying/removing/querying in simple mode.\n");
 	removed[2103];query(db, 2103, removed);removed.erase(2103);
 	ADD(2102); ADD(2103); ADD(2104); ADD(2102);

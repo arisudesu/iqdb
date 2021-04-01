@@ -29,7 +29,7 @@ struct delta_value {
 	delta_value() { }
 	delta_value(size_t v) : full(v) { }
 
-	void put(unsigned char v, int pos) { full |= v << (8 * pos); }
+	void put(unsigned char v, int pos) { full |= (size_t)v << (8 * pos); }
 	unsigned char get() { unsigned char v = full; full >>= 8; return v; }
 
 	size_t full;

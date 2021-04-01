@@ -27,7 +27,9 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <netdb.h>
 #include <signal.h>
 
@@ -36,14 +38,16 @@
 #include <mcheck.h>
 #endif
 
+#include <algorithm>
 #include <list>
+#include <vector>
 
 #include "auto_clean.h"
 #define DEBUG_IQDB
 #include "debug.h"
 #include "imgdb.h"
 
-int debug_level = DEBUG_errors | DEBUG_base | DEBUG_summary; // | DEBUG_dupe_finder; // | DEBUG_resizer;
+int debug_level = DEBUG_errors | DEBUG_base | DEBUG_summary | DEBUG_connections | DEBUG_images | DEBUG_imgdb; // | DEBUG_dupe_finder; // | DEBUG_resizer;
 
 static void die(const char fmt[], ...) __attribute__ ((format (printf, 1, 2))) __attribute__ ((noreturn));
 static void die(const char fmt[], ...) {
@@ -57,25 +61,54 @@ static void die(const char fmt[], ...) {
 	exit(1);
 }
 
-imgdb::dbSpace* loaddb(const char* fn, int mode) {
-	imgdb::dbSpace* db = imgdb::dbSpace::load_file(fn, mode);
-	DEBUG(summary)("Database loaded from %s, has %zd images.\n", fn, db->getImgCount());
-	return db;
-}
-
 class dbSpaceAuto : public AutoCleanPtr<imgdb::dbSpace> {
 public:
 	dbSpaceAuto() { };
-	dbSpaceAuto(const char* filename, int mode) : AutoCleanPtr<imgdb::dbSpace>(loaddb(filename, mode)) { };
+	dbSpaceAuto(const char* filename, int mode) : AutoCleanPtr<imgdb::dbSpace>(loaddb(filename, mode)), m_filename(filename) { };
+	dbSpaceAuto(const dbSpaceAuto& other) { if (other != NULL) throw imgdb::internal_error("Can't copy-construct dbSpaceAuto."); }
+
+	void save() { (*this)->save_file(m_filename.c_str()); }
+	void load(const char* filename, int mode) { this->set(loaddb(filename, mode)); m_filename = filename; }
+	void clear() { this->set(NULL); }
+
+	const std::string& filename() const { return m_filename; }
+
+private:
+	static imgdb::dbSpace* loaddb(const char* fn, int mode) {
+		imgdb::dbSpace* db = imgdb::dbSpace::load_file(fn, mode);
+		DEBUG(summary)("Database loaded from %s, has %zd images.\n", fn, db->getImgCount());
+		return db;
+	}
+
+	std::string m_filename;
 };
 
-typedef dbSpaceAuto dbSpaceAutoList[];
+class dbSpaceAutoMap {
+	typedef std::list<dbSpaceAuto> list_type;
+	typedef std::vector<dbSpaceAuto*> array_type;
 
-inline dbSpaceAuto& check(dbSpaceAutoList dbs, unsigned int ndbs, unsigned int dbid) {
-	if (dbid >= ndbs)
-		throw imgdb::param_error("dbId out of range.");
-	return dbs[dbid];
-}
+public:
+	dbSpaceAutoMap(int ndbs, int mode, const char* const * filenames) {
+		m_array.reserve(ndbs);
+		while (ndbs--) (*m_array.insert(m_array.end(), &*m_list.insert(m_list.end(), dbSpaceAuto())))->load(*filenames++, mode);
+	}
+
+	dbSpaceAuto& at(unsigned int dbid, bool append = false) {
+		while (append && size() <= dbid) m_array.insert(m_array.end(), &*m_list.insert(m_list.end(), dbSpaceAuto()));
+		if (dbid >= size() || (!append && !*m_array[dbid])) throw imgdb::param_error("dbId out of range.");
+		return *m_array[dbid];
+	}
+
+	dbSpaceAuto& operator [] (unsigned int dbid) {
+		return *m_array[dbid];
+	}
+
+	size_t size() const { return m_array.size(); }
+
+private:
+	array_type m_array;
+	list_type  m_list;
+};
 
 #define ScD(x) ((double)(x)/imgdb::ScoreMax)
 #define DScD(x) ScD(((x)/imgdb::ScoreMax))
@@ -253,10 +286,10 @@ fprintf(stderr, "Min score: %.1f\n", ScD(m));
 
 	dupe_map dupes;
 
-	fprintf(stderr, "Finding std.dev=%d dupes from %zd images.\n", mindev, db->getImgCount());
+	DEBUG(dupe_finder)("Finding std.dev=%d dupes from %zd images.\n", mindev, db->getImgCount());
 	imgdb::imageId_list images = db->getImgIdList();
 	for (imgdb::imageId_list::const_iterator itr = images.begin(); itr != images.end(); ++itr) {
-		fprintf(stderr, "%3zd%%\r", 100*(itr - images.begin())/images.size());
+		DEBUG(dupe_finder)("%3zd%%\r", 100*(itr - images.begin())/images.size());
 		imgdb::sim_vector sim = db->queryImg(imgdb::queryArg(db, *itr, 16, 0)); // imgdb::dbSpace::flag_nocommon));
 
 		imgdb::Score min = min_sim(sim, mindev << imgdb::ScoreScale, imgdb::ScoreMax / 2);
@@ -329,26 +362,26 @@ void add(const char* fn) {
 		imgdb::imageId id;
 		int width = -1, height = -1;
 		if (!fgets(line, sizeof(line), stdin)) {
-			fprintf(stderr, "Read error.\n");
+			DEBUG(errors)("Read error.\n");
 			continue;
 		}
 		if (sscanf(line, "%lx %d %d:%1023[^\r\n]\n", &id, &width, &height, fn) != 4  &&
 		    sscanf(line, "%lx:%1023[^\r\n]\n", &id, fn) != 2) {
-			fprintf(stderr, "Invalid line %s\n", line);
+			DEBUG(errors)("Invalid line %s\n", line);
 			continue;
 		}
 		try {
 			if (!db->hasImage(id)) {
-				fprintf(stderr, "Adding %s = %08lx...\r", fn, id);
+				DEBUG(images)("Adding %s = %08lx...\r", fn, id);
 				db->addImage(id, fn);
 			}
 			if (width != -1 && height != -1)
 				db->setImageRes(id, width, height);
 		} catch (const imgdb::simple_error& err) {
-                	fprintf(stderr, "%s: %s %s\n", fn, err.type(), err.what());
+                	DEBUG(errors)("%s: %s %s\n", fn, err.type(), err.what());
 		}
 	}
-	db->save_file(fn);
+	db.save();
 }
 
 void list(const char* fn) {
@@ -360,7 +393,7 @@ void list(const char* fn) {
 void rehash(const char* fn) {
 	dbSpaceAuto db(fn, imgdb::dbSpace::mode_normal);
 	db->rehash();
-	db->save_file(fn);
+	db.save();
 }
 
 void stats(const char* fn) {
@@ -399,7 +432,7 @@ void sim(const char* fn, imgdb::imageId id, int numres) {
 
 enum event_t { DO_QUITANDSAVE };
 
-#define DB check(dbs, ndbs, dbid)
+#define DB dbs.at(dbid)
 
 typedef std::pair<imgdb::sim_value,int> sim_db_value;
 struct cmp_sim_high : public std::binary_function<sim_db_value,sim_db_value,bool> {
@@ -407,7 +440,7 @@ struct cmp_sim_high : public std::binary_function<sim_db_value,sim_db_value,bool
 };
 struct query_t { unsigned int dbid, numres, flags; };
 
-void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
+void do_commands(FILE* rd, FILE* wr, dbSpaceAutoMap& dbs, bool allow_maint) {
 	imgdb::queryOpt queryOpt;
 
 	while (!feof(rd)) try {
@@ -428,6 +461,7 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 		}
 		//fprintf(stderr, "Command: %s", command);
 		char *arg = strchr(command, ' ');
+		if (!arg) arg = strchr(command, '\n');
 		if (!arg) {
 			fprintf(wr, "300 Invalid command: %s\n", command);
 			continue;
@@ -445,6 +479,7 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 		#endif
 
 		if (!strcmp(command, "quit")) {
+			if (!allow_maint) throw imgdb::usage_error("Not authorized");
 			fprintf(wr, "100 Done.\n");
 			fflush(wr);
 			throw DO_QUITANDSAVE;
@@ -509,7 +544,7 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 			std::vector<sim_db_value> sim;
 			imgdb::Score merge_min = 100 * imgdb::ScoreMax;
 			for (query_list::iterator itr = queries.begin(); itr != queries.end(); ++itr) {
-				imgdb::sim_vector dbsim = check(dbs, ndbs, itr->dbid)->queryImg(imgdb::queryArg(img, itr->numres + 1, itr->flags).merge(multiOpt));
+				imgdb::sim_vector dbsim = dbs.at(itr->dbid)->queryImg(imgdb::queryArg(img, itr->numres + 1, itr->flags).merge(multiOpt));
 				if (dbsim.empty()) continue;
 
 				// Scale it so that DBs with different noise levels are all normalized:
@@ -584,6 +619,7 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 				fprintf(wr, "100 %08lx %d %d\n", itr->id, itr->width, itr->height);
 
 		} else if (!strcmp(command, "rehash")) {
+			if (!allow_maint) throw imgdb::usage_error("Not authorized");
 			int dbid;
 			if (sscanf(arg, "%d", &dbid) != 1)
 				throw imgdb::param_error("Format: rehash <dbid>");
@@ -602,13 +638,38 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 				fprintf(wr, "100 %d %zd\n", itr->first, itr->second);
 
 		} else if (!strcmp(command, "saveas")) {
+			if (!allow_maint) throw imgdb::usage_error("Not authorized");
 			char fn[1024];
 			int dbid;
 			if (sscanf(arg, "%d %1023[^\r\n]\n", &dbid, fn) != 2)
 				throw imgdb::param_error("Format: saveas <dbid> <file>");
 
 			fprintf(wr, "100 Saving DB %d to %s...\n", dbid, fn);
-			DB->save_file(fn);
+			DB.save();
+
+		} else if (!strcmp(command, "load")) {
+			if (!allow_maint) throw imgdb::usage_error("Not authorized");
+			char fn[1024], mode[32];
+			int dbid;
+			if (sscanf(arg, "%d %31[^\r\n ] %1023[^\r\n]\n", &dbid, mode, fn) != 3)
+				throw imgdb::param_error("Format: load <dbid> <mode> <file>");
+			if ((size_t)dbid < dbs.size() && dbs[dbid])
+				throw imgdb::param_error("Format: dbid already in use.");
+
+			fprintf(wr, "100 Loading DB %d from %s...\n", dbid, fn);
+			dbs.at(dbid, true).load(fn, imgdb::dbSpace::mode_from_name(mode));
+
+		} else if (!strcmp(command, "drop")) {
+			if (!allow_maint) throw imgdb::usage_error("Not authorized");
+			int dbid;
+			if (sscanf(arg, "%d", &dbid) != 1)
+				throw imgdb::param_error("Format: drop <dbid>");
+
+			DB.clear();
+			fprintf(wr, "100 Dropped DB %d.\n", dbid);
+
+		} else if (!strcmp(command, "db_list")) {
+			for (size_t i = 0; i < dbs.size(); i++) if (dbs[i]) fprintf(wr, "102 %zd %s\n", i, dbs[i].filename().c_str());
 
 		} else if (!strcmp(command, "ping")) {
 			fprintf(wr, "100 Pong.\n");
@@ -636,17 +697,15 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 }
 
 void command(int numfiles, char** files) {
-	dbSpaceAuto dbs[numfiles];
-	for (int db = 0; db < numfiles; db++)
-		dbs[db].set(loaddb(files[db], imgdb::dbSpace::mode_alter));
+	dbSpaceAutoMap dbs(numfiles, imgdb::dbSpace::mode_alter, files);
 
 	try {
-		do_commands(stdin, stdout, dbs, numfiles);
+		do_commands(stdin, stdout, dbs, true);
 
 	} catch (const event_t& event) {
 		if (event != DO_QUITANDSAVE) return;
-		for (int db = 0; db < numfiles; db++)
-			dbs[db]->save_file(files[db]);
+		for (int dbid = 0; dbid < numfiles; dbid++)
+			DB.save();
 	}
 }
 
@@ -677,7 +736,39 @@ struct socket_stream {
 	FILE* wr;
 };
 
-void server(const char* hostport, int numfiles, char** files) {
+bool set_socket(int fd, struct sockaddr_in& bindaddr, int force) {
+	if (fd == -1) die("Can't create socket: %s\n", strerror(errno));
+
+	int opt = 1;
+	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) die("Can't set SO_REUSEADDR: %s\n", strerror(errno));
+	if (bind(fd, (struct sockaddr*) &bindaddr, sizeof(bindaddr)) ||
+	    listen(fd, 64)) {
+		if (force) die("Can't bind/listen: %s\n", strerror(errno));
+		DEBUG(base)("Socket in use, will replace server later.\n");
+		return false;
+	} else {
+		DEBUG(base)("Listening on port %d.\n", ntohs(bindaddr.sin_port));
+		return true;
+	}
+}
+
+void rebind(int fd, struct sockaddr_in& bindaddr) {
+	int retry = 0;
+	DEBUG(base)("Binding to %08x:%d... ", ntohl(bindaddr.sin_addr.s_addr), ntohs(bindaddr.sin_port));
+	while (bind(fd, (struct sockaddr*) &bindaddr, sizeof(bindaddr))) {
+		if (retry++ > 60) die("Could not bind: %s.\n", strerror(errno));
+		DEBUG_CONT(base)(DEBUG_OUT, "Can't bind yet: %s.\n", strerror(errno));
+		sleep(1);
+		DEBUG(base)("%s", "");
+	}
+	DEBUG_CONT(base)(DEBUG_OUT, "bind ok.\n");
+	if (listen(fd, 64))
+		die("Can't listen: %s.\n", strerror(errno));
+
+	DEBUG(base)("Listening on port %d.\n", ntohs(bindaddr.sin_port));
+}
+
+void server(const char* hostport, int numfiles, char** files, bool listen2) {
 	int port;
 	char dummy;
 	char host[1024];
@@ -701,71 +792,71 @@ void server(const char* hostport, int numfiles, char** files) {
 	hints.ai_protocol = IPPROTO_TCP;
 	if (int ret = getaddrinfo(host, NULL, &hints, &ai)) die("Can't resolve host: %s\n", gai_strerror(ret));
 
-	struct sockaddr_in bindaddr;
-	memcpy(&bindaddr, ai->ai_addr, std::min<size_t>(sizeof(bindaddr), ai->ai_addrlen));
-	bindaddr.sin_port = htons(port);
+	struct sockaddr_in bindaddr_low;
+	struct sockaddr_in bindaddr_high;
+	memcpy(&bindaddr_low, ai->ai_addr, std::min<size_t>(sizeof(bindaddr_low), ai->ai_addrlen));
+	memcpy(&bindaddr_high, ai->ai_addr, std::min<size_t>(sizeof(bindaddr_high), ai->ai_addrlen));
+	bindaddr_low.sin_port = htons(port);
+	bindaddr_high.sin_port = htons(port - listen2);
 	freeaddrinfo(ai);
 
 	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) die("Can't ignore SIGPIPE: %s\n", strerror(errno));
 
-	int server_fd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (server_fd == -1) die("Can't create socket: %s\n", strerror(errno));
+	int fd_high = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+	int fd_low = listen2 ? socket(PF_INET, SOCK_STREAM, IPPROTO_TCP) : -1;
+	int fd_max = listen2 ? std::max(fd_high, fd_low) : fd_high;
+	bool success = set_socket(fd_high, bindaddr_high, !replace);
+	if (listen2 && set_socket(fd_low, bindaddr_low, !replace) != success)
+		die("Only one socket failed to bind, this is weird, aborting!\n");
 
-	int opt = 1;
-	if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) die("Can't set SO_REUSEADDR: %s\n", strerror(errno));
-	if (bind(server_fd, (struct sockaddr*) &bindaddr, sizeof(bindaddr)) ||
-	    listen(server_fd, 64)) {
-		if (!replace) die("Can't bind/listen: %s\n", strerror(errno));
-		replace = 2;
-		fprintf(stderr, "Socket in use, will replace server later.\n");
-	} else {
-		fprintf(stderr, "Listening on port %d.\n", port);
-	}
+	dbSpaceAutoMap dbs(numfiles, imgdb::dbSpace::mode_simple, files);
 
-	dbSpaceAuto dbs[numfiles];
-	for (int db = 0; db < numfiles; db++)
-		dbs[db].set(loaddb(files[db], imgdb::dbSpace::mode_simple));
-
-	if (replace == 2) {
+	if (!success) {
 		int other_fd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
 		if (other_fd == -1)
 			die("Can't create socket: %s.\n", strerror(errno));
-		if (connect(other_fd, (struct sockaddr*) &bindaddr, sizeof(bindaddr)))
+		if (connect(other_fd, (struct sockaddr*) &bindaddr_high, sizeof(bindaddr_high)))
 			die("Can't connect to old server: %s.\n", strerror(errno));
 
 		socket_stream stream(other_fd);
-		fprintf(stderr, "Sending quit command.\n");
+		DEBUG(base)("Sending quit command.\n");
 		fputs("quit now\n", stream.wr); fflush(stream.wr);
 
 		char buf[1024];
 		while (fgets(buf, sizeof(buf), stream.rd))
-			fprintf(stderr, " --> %s", buf);
+			DEBUG(base)(" --> %s", buf);
 
-		int retry = 0;
-		fprintf(stderr, "Binding to %08x:%d... ", ntohl(bindaddr.sin_addr.s_addr), ntohs(bindaddr.sin_port));
-		while (bind(server_fd, (struct sockaddr*) &bindaddr, sizeof(bindaddr))) {
-			if (retry++ > 60) die("Could not bind: %s.\n", strerror(errno));
-			fprintf(stderr, "Can't bind yet: %s.\n", strerror(errno));
-			sleep(1);
-		}
-		fprintf(stderr, "bind ok.\n");
-		if (listen(server_fd, 64))
-			die("Can't listen: %s.\n", strerror(errno));
-
-		fprintf(stderr, "Listening on port %d.\n", port);
+		if (listen2) rebind(fd_low, bindaddr_low);
+		rebind(fd_high, bindaddr_high);
 	}
 
+	fd_set read_fds;
+	FD_ZERO(&read_fds);
+
 	while (1) {
+		FD_SET(fd_high, &read_fds);
+		if (listen2) FD_SET(fd_low,  &read_fds);
+
+		int nfds = select(fd_max + 1, &read_fds, NULL, NULL, NULL);
+		if (nfds < 1) die("select() failed: %s\n", strerror(errno));
+
 		struct sockaddr_in client;
 		socklen_t len = sizeof(client);
-		int fd = accept(server_fd, (struct sockaddr*) &client, &len);
-		if (fd == -1) die("accept() failed: %s\n", strerror(errno));
-		fprintf(stderr, "Accepted connection from %s:%d\n", inet_ntoa(client.sin_addr), client.sin_port);
+
+		bool is_high = FD_ISSET(fd_high, &read_fds);
+
+		int fd = accept(is_high ? fd_high : fd_low, (struct sockaddr*) &client, &len);
+		if (fd == -1) {
+			DEBUG(errors)("accept() failed: %s\n", strerror(errno));
+			continue;
+		}
+
+		DEBUG(connections)("Accepted %s connection from %s:%d\n", is_high ? "high priority" : "normal", inet_ntoa(client.sin_addr), client.sin_port);
 
 		socket_stream stream(fd);
 
 		try {
-			do_commands(stream.rd, stream.wr, dbs, numfiles);
+			do_commands(stream.rd, stream.wr, dbs, is_high);
 
 		} catch (const event_t& event) {
 			if (event == DO_QUITANDSAVE) return;
@@ -832,7 +923,9 @@ int main(int argc, char** argv) {
 	} else if (!strcasecmp(argv[1], "command")) {
 		command(argc-2, argv+2);
 	} else if (!strcasecmp(argv[1], "listen")) {
-		server(argv[2], argc-3, argv+3);
+		server(argv[2], argc-3, argv+3, false);
+	} else if (!strcasecmp(argv[1], "listen2")) {
+		server(argv[2], argc-3, argv+3, true);
 	} else if (!strcasecmp(argv[1], "statistics")) {
 		stats(filename);
 	} else if (!strcasecmp(argv[1], "count")) {
@@ -846,11 +939,11 @@ int main(int argc, char** argv) {
 
   // Handle this specially because it means we need to fix the DB before restarting :(
   } catch (const imgdb::data_error& err) {
-	fprintf(stderr, "Data error: %s.\n", err.what());
+	DEBUG(errors)("Data error: %s.\n", err.what());
 	exit(10);
 
   } catch (const imgdb::base_error& err) {
-	fprintf(stderr, "Caught error %s: %s.\n", err.type(), err.what());
+	DEBUG(errors)("Caught error %s: %s.\n", err.type(), err.what());
 	if (errno) perror("Last system error");
   }
 

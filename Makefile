@@ -40,13 +40,13 @@ all:	iqdb
 
 %.o : %.h
 %.o : %.cpp
-iqdb.o : imgdb.h haar.h auto_clean.h
-imgdb.o : imgdb.h imglib.h haar.h auto_clean.h delta_queue.h
-test-db.o : imgdb.h delta_queue.h
+iqdb.o : imgdb.h haar.h auto_clean.h debug.h
+imgdb.o : imgdb.h imglib.h haar.h auto_clean.h delta_queue.h debug.h
+test-db.o : imgdb.h delta_queue.h debug.h
 haar.o :
 %.le.o : %.h
-iqdb.le.o : imgdb.h haar.h auto_clean.h
-imgdb.le.o : imgdb.h imglib.h haar.h auto_clean.h delta_queue.h
+iqdb.le.o : imgdb.h haar.h auto_clean.h debug.h
+imgdb.le.o : imgdb.h imglib.h haar.h auto_clean.h delta_queue.h debug.h
 haar.le.o :
 
 .ALWAYS:
@@ -67,16 +67,13 @@ $(error Unsupported image library '${IMG_LIB}' selected.)
 endif
 endif
 
-% : %.o haar.o imgdb.o ${IMG_objs} # bloom_filter.o
+% : %.o haar.o imgdb.o debug.o ${IMG_objs} # bloom_filter.o
 	g++ -o $@ $^ ${CFLAGS} ${LDFLAGS} ${IMG_libs} ${DEFS} ${EXTRADEFS}
 
-%.le : %.le.o haar.le.o imgdb.le.o ${IMG_objs} # bloom_filter.le.o
+%.le : %.le.o haar.le.o imgdb.le.o debug.le.o ${IMG_objs} # bloom_filter.le.o
 	g++ -o $@ $^ ${CFLAGS} ${LDFLAGS} ${IMG_libs} ${DEFS} ${EXTRADEFS}
 
-dler : dler.o resizer.o
-	g++ -o $@ $^ ${CFLAGS} ${LDFLAGS} -g -levent -lcurl -lgd ${DEFS} ${EXTRADEFS}
-
-test-resizer : test-resizer.o resizer.o
+test-resizer : test-resizer.o resizer.o debug.o
 	g++ -o $@ $^ ${CFLAGS} ${LDFLAGS} -g -lgd -ljpeg -lpng ${DEFS} ${EXTRADEFS} `gdlib-config --ldflags`
 
 %.o : %.cpp

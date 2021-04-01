@@ -15,10 +15,11 @@ fi
 trap "rm -f update.lock" SIGHUP SIGINT SIGQUIT SIGTERM EXIT
 
 export http_proxy=http://localhost:3128/
+#export http_proxy=http://rps:3129/
 
 MODE="$1"
 if [ "$MODE" = "auto" ]; then
-	MODE=`perl -le 'print 2<24*-M $ARGV[0]?"full":"update"' ~/doujin/.lastupdate`
+	MODE=`perl -le 'print 2<24*-M $ARGV[0]?"full":"update"' ~/doujin/.lastfullupdate`
 fi;
 if [ "$MODE" = "update" ]; then
 	echo Quick update
@@ -26,8 +27,11 @@ if [ "$MODE" = "update" ]; then
 	./danbooru-change danbooru   || let EC=$EC+2
 	./danbooru-change konachan   || let EC=$EC+2
 	./danbooru-change moe.imouto || let EC=$EC+2
+	./danbooru-change 4scrape    || let EC=$EC+2
+	./danbooru-change sankaku    || let EC=$EC+2
+	#./danbooru-change kurankuran || let EC=$EC+2
 
-	touch ~/doujin/.lastquickupdate
+	touch ~/doujin/.lastquickupdate ~/doujin/.lastupdate
 	exit $EC
 elif [ "$MODE" = "full" ]; then
 	echo Full update
@@ -35,16 +39,16 @@ elif [ "$MODE" = "full" ]; then
 	./danbooru-change danbooru   full  || let EC=$EC+2
 	./danbooru-change konachan   full  || let EC=$EC+2
 	./danbooru-change moe.imouto full  || let EC=$EC+2
+	./danbooru-change 4scrape          || let EC=$EC+2
+	./danbooru-change sankaku    full  || let EC=$EC+2
+	#./danbooru-change kurankuran full  || let EC=$EC+2
 
-	touch ~/doujin/.lastupdate
+	touch ~/doujin/.lastfullupdate ~/doujin/.lastupdate
 	exit $EC
 elif [ "$MODE" != "restart" ]; then
 	echo Unknown mode, run as $0 auto/update/full/restart
 	exit 1;
 fi;
-
-echo Starting dler...
-screen -dmS dlerDeb gdb -ex "r" -ex "call close_listen()" --args dler.server 5801
 
 SCREEN=iqdbOne
 OTHER=iqdbTwo
@@ -55,7 +59,7 @@ if screen -ls|grep $SCREEN &> /dev/null; then
 fi;
 PID=`screen -ls|grep $OTHER|perl -lne 'print $1 if /(\d+)/'`
 echo "Starting screen $SCREEN (other $OTHER pid $PID)"
-screen -dmS $SCREEN ~/bin/iqdb.server listen 5566 -r ~/stuff/haruhi.idb ~/stuff/danbooru.idb ~/stuff/konachan.idb ~/stuff/moe.imouto.idb
+screen -dmS $SCREEN ~/bin/iqdb.server listen2 5566 -r `./def-dbs`
 echo Waiting for $PID to exit.
 COUNT=0
 while [ -n "$PID" -a -d /proc/$PID ]; do

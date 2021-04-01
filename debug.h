@@ -1,10 +1,8 @@
 #ifndef IQDB_DEBUG_H
 #define IQDB_DEBUG_H
 
-#include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
-
 #include <sys/time.h>
 
 #define DEBUG_OUT stderr
@@ -40,37 +38,30 @@ DEF_DEBUG(protocol,	20)
 DEF_DEBUG(iqdb,		21)
 #endif
 #ifdef DEBUG_IQDB
+DEF_DEBUG(connections,	7)
+DEF_DEBUG(images,	8)
 DEF_DEBUG(dupe_finder,	10)
+#endif
+#ifdef DEBUG_IPV6
+DEF_DEBUG(connections,	7)
+DEF_DEBUG(libevent,	10)
+DEF_DEBUG(events,	13)
+DEF_DEBUG(packets,	16)
+DEF_DEBUG(io,		18)
+DEF_DEBUG(addresses,	21)
 #endif
 
 DEF_DEBUG(resizer,	22)
 DEF_DEBUG(image_info,	23)
 DEF_DEBUG(prescale,	24)
+DEF_DEBUG(imgdb,        25)
 
-extern int debug_level;
-
-inline timeval now() { timeval tv; gettimeofday(&tv, NULL); return tv; }
-inline float elapsed(const timeval& from, const timeval& to = now()) {
+static inline timeval now() { timeval tv; gettimeofday(&tv, NULL); return tv; }
+static inline float elapsed(const timeval& from, const timeval& to = now()) {
 	return (to.tv_sec - from.tv_sec) + ((float)(to.tv_usec - from.tv_usec))/1e6;
 }
 
 __attribute__ ((format (printf, 1, 2)))
-static void debug(const char fmt[], ...) {
-	char timestr[16];
-	timeval t = now();
-	time_t tm = time(NULL);
-
-	timestr[sizeof(timestr)-1] = 0;
-	strftime(timestr, sizeof(timestr)-1, "%H:%M:%S", localtime(&tm));
-	fputs(timestr, DEBUG_OUT);
-	snprintf(timestr, sizeof(timestr)-1, "%.3f ", ((float)t.tv_usec)/1e6);
-	fputs(timestr+1, DEBUG_OUT);
-
-	va_list	args;
-
-	va_start(args, fmt);
-	vfprintf(DEBUG_OUT, fmt, args);
-	va_end(args);
-}
+void debug(const char fmt[], ...);
 
 #endif // IQDB_DEBUG_H
