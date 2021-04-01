@@ -162,7 +162,7 @@ fprintf(stderr, "Min score: %.1f\n", ScD(m));
 	imgdb::imageId_list images = db->getImgIdList();
 	for (imgdb::imageId_list::const_iterator itr = images.begin(); itr != images.end(); ++itr) {
 		fprintf(stderr, "%3zd%%\r", 100*(itr - images.begin())/images.size());
-		imgdb::sim_vector sim = db->queryImgID(*itr, 16, imgdb::dbSpace::flag_onlyabove | imgdb::dbSpace::flag_nocommon);
+		imgdb::sim_vector sim = db->queryImg(imgdb::queryArg(db.ptr(), *itr, 16, imgdb::dbSpace::flag_onlyabove | imgdb::dbSpace::flag_nocommon));
 
 		// This is not needed when imgdb::dbSpace::flag_onlyabove starts working:
 		sim.erase(std::partition(sim.begin(), sim.end(), id_not_below(*itr)), sim.end());
@@ -268,7 +268,7 @@ void count(const char* fn) {
 
 void query(const char* fn, const char* img, int numres, int flags) {
 	dbSpaceAuto db(fn, imgdb::dbSpace::mode_simple);
-	imgdb::sim_vector sim = db->queryImgFile(img, numres, flags);
+	imgdb::sim_vector sim = db->queryImg(imgdb::queryArg(img, numres, flags));
 	for (size_t i = 0; i < sim.size(); i++)
 		printf("%08lx %lf %d %d\n", sim[i].id, (double)sim[i].score / imgdb::ScoreMax, sim[i].width, sim[i].height);
 }
@@ -281,7 +281,7 @@ void diff(const char* fn, imgdb::imageId id1, imgdb::imageId id2) {
 
 void sim(const char* fn, imgdb::imageId id, int numres) {
 	dbSpaceAuto db(fn, imgdb::dbSpace::mode_readonly);
-	imgdb::sim_vector sim = db->queryImgID(id, numres, 0);
+	imgdb::sim_vector sim = db->queryImg(imgdb::queryArg(db.ptr(), id, numres, 0));
 	for (size_t i = 0; i < sim.size(); i++)
 		printf("%08lx %lf %d %d\n", sim[i].id, (double)sim[i].score / imgdb::ScoreMax, sim[i].width, sim[i].height);
 }
@@ -297,7 +297,12 @@ struct cmp_sim_high : public std::binary_function<sim_db_value,sim_db_value,bool
 struct query_t { unsigned int dbid, numres, flags; };
 
 void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
+	imgdb::queryOpt queryOpt;
+
 	while (!feof(rd)) try {
+		fprintf(wr, "000 iqdb ready\n");
+		fflush(wr);
+
 		char command[1024];
 		if (!fgets(command, sizeof(command), rd)) {
 			if (feof(rd)) {
@@ -347,13 +352,26 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 			if (sscanf(arg, "%i\n", &dbid) != 1) throw imgdb::param_error("Format: count <dbid>");
 			fprintf(wr, "101 count=%zd\n", DB->getImgCount());
 
+		} else if (!strcmp(command, "query_opt")) {
+			char *opt_arg = strchr(arg, ' ');
+			if (!opt_arg) throw imgdb::param_error("Format: query_opt <option> <arguments...>");
+			*opt_arg++ = 0;
+			if (!strcmp(arg, "mask")) {
+				int mask_and, mask_xor;
+				if (sscanf(opt_arg, "%i %i\n", &mask_and, &mask_xor) != 2) throw imgdb::param_error("Format: query_opt mask AND XOR");
+				queryOpt.mask(mask_and, mask_xor);
+				fprintf(wr, "100 Using mask and=%d xor=%d\n", mask_and, mask_xor);
+			} else {
+				throw imgdb::param_error("Unknown query option");
+			}
+
 		} else if (!strcmp(command, "query")) {
 			char filename[1024];
 			int dbid, flags, numres;
 			if (sscanf(arg, "%i %i %i %1023[^\r\n]\n", &dbid, &flags, &numres, filename) != 4)
 				throw imgdb::param_error("Format: query <dbid> <flags> <numres> <filename>");
 
-			imgdb::sim_vector sim = DB->queryImgFile(filename, numres, flags);
+			imgdb::sim_vector sim = DB->queryImg(imgdb::queryArg(filename, numres, flags).coalesce(queryOpt));
 			for (size_t i = 0; i < sim.size(); i++)
 				fprintf(wr, "200 %08lx %lf %d %d\n", sim[i].id, (double)sim[i].score / imgdb::ScoreMax, sim[i].width, sim[i].height);
 
@@ -361,6 +379,7 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 			int count;
 			typedef std::vector<query_t> query_list;
 			query_list queries;
+			imgdb::queryOpt multiOpt = queryOpt;
 
 			do {
 				query_t query;
@@ -374,11 +393,12 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 
 			imgdb::ImgData img;
 			imgdb::dbSpace::imgDataFromFile(arg, &img);
+			queryOpt.reset();
 
 			std::vector<sim_db_value> sim;
 			imgdb::Score merge_min = 100 * imgdb::ScoreMax;
 			for (query_list::iterator itr = queries.begin(); itr != queries.end(); ++itr) {
-				imgdb::sim_vector dbsim = check(dbs, ndbs, itr->dbid)->queryImgData(img, itr->numres + 1, itr->flags);
+				imgdb::sim_vector dbsim = check(dbs, ndbs, itr->dbid)->queryImg(imgdb::queryArg(img, itr->numres + 1, itr->flags).merge(multiOpt));
 				if (dbsim.empty()) continue;
 
 				// Scale it so that DBs with different noise levels are all normalized:
@@ -420,7 +440,7 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 
 			// Could just catch imgdb::param_error, but this is so common here that handling it explicitly is better.
 			if (!DB->hasImage(id)) {
-				fprintf(wr, "100 Adding %s = %d:%08lx...\r", fn, dbid, id);
+				fprintf(wr, "100 Adding %s = %d:%08lx...\n", fn, dbid, id);
 				DB->addImage(id, fn);
 			}
 
@@ -460,6 +480,16 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 			fprintf(wr, "100 Rehashing %d...\n", dbid);
 			DB->rehash();
 
+		} else if (!strcmp(command, "coeff_stats")) {
+			int dbid;
+			if (sscanf(arg, "%d", &dbid) != 1)
+				throw imgdb::param_error("Format: coeff_stats <dbid>");
+
+			fprintf(wr, "100 Retrieving coefficient stats for %d...\n", dbid);
+			imgdb::stats_t stats = DB->getCoeffStats();
+			for (imgdb::stats_t::iterator itr = stats.begin(); itr != stats.end(); ++itr)
+				fprintf(wr, "100 %d %zd\n", itr->first, itr->second);
+
 		} else if (!strcmp(command, "saveas")) {
 			char fn[1024];
 			int dbid;
@@ -487,8 +517,6 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 			fclose(f);
 		}
 		#endif
-
-		fflush(wr);
 
 	} catch (const imgdb::simple_error& err) {
 		fprintf(wr, "301 %s %s\n", err.type(), err.what());
@@ -605,7 +633,7 @@ void server(const char* hostport, int numfiles, char** files) {
 		int retry = 0;
 		fprintf(stderr, "Binding to %08x:%d... ", ntohl(bindaddr.sin_addr.s_addr), ntohs(bindaddr.sin_port));
 		while (bind(server_fd, (struct sockaddr*) &bindaddr, sizeof(bindaddr))) {
-			if (retry++ > 3) die("Could not bind: %s.\n", strerror(errno));
+			if (retry++ > 60) die("Could not bind: %s.\n", strerror(errno));
 			fprintf(stderr, "Can't bind yet: %s.\n", strerror(errno));
 			sleep(1);
 		}

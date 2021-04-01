@@ -4,13 +4,51 @@
 // If it runs without throwing any exceptions, it all works fine!
 
 #include <tr1/unordered_map>
+#include "delta_queue.h"
 #include "imgdb.h"
 
 static const char* fn = "test-db.idb";
 
+class DeltaTest : public delta_queue {
+public:
+	static void test();
+};
+
+void DeltaTest::test() {
+	DeltaTest delta;
+	std::vector<size_t> comp;
+
+	printf("Testing delta queue... ");
+	size_t last = 0;
+	delta.reserve(100000);
+	for (int i = 0; i < 100000; i++) {
+		bool type = (rand() & 0xff) < 10;
+		size_t val = 1 + (rand() & (type ? 0xffff: 0xfd)) + (type * 254);
+		if ((val > 254) != type) { printf("%d %d\n", type, val); throw imgdb::internal_error("Bad value!"); }
+		last += val;
+		delta.push_back(last);
+		comp.push_back(last);
+	}
+	printf("%zd values, %zd used in container (capacity %zd, %d%%/%d%%). Verifying... ", delta.size(), delta.m_base.size(), delta.m_base.capacity(), delta.m_base.capacity()*100/delta.size(), delta.m_base.size()*100/delta.size());
+	iterator itr = delta.begin();
+	std::vector<size_t>::iterator cItr = comp.begin();
+	int i = 0;
+	for (; itr != delta.end() && cItr != comp.end(); ++itr, ++cItr, ++i) {
+		if (*itr != *cItr) {
+			printf("\nFailed! Element %d is %zd but should be %zd!\n", i, *itr, *cItr);
+			exit(1);
+		}
+	}
+	if (itr != delta.end()) { printf("\nFailed! Did not reach end at element %d!\n", i); exit(1); }
+	if (cItr != comp.end()) { printf("\nFailed! Reached end prematurely at element %d!\n", i); exit(1); }
+	printf("OK.\n");
+}
+
 inline Idx shuffle(Idx old, int add) {
 	return (old < 0 ? -(-old + add - 1) % 16000 - 1 : (old + add - 1) % 16000 + 1);
 }
+
+typedef std::map<imgdb::imageId,bool> deleted_t;
 
 imgdb::ImgData data, org;
 imgdb::ImgData* make_data(int id) {
@@ -27,14 +65,14 @@ imgdb::ImgData* make_data(int id) {
 	return &data;
 }
 
-void check(imgdb::dbSpace* db, int range, const imgdb::imageId_list removed) {
+void check(imgdb::dbSpace* db, int range, const deleted_t& removed) {
 	int error = 0;
 	typedef std::tr1::unordered_map<imgdb::imageId, int> id_map;
 	id_map ids;
 	for (int i = 1; i <= range; i++)
 		ids[i] = 0;
-	for (imgdb::imageId_list::const_iterator itr = removed.begin(); itr != removed.end(); ++itr)
-		ids[*itr] = 2;
+	for (deleted_t::const_iterator itr = removed.begin(); itr != removed.end(); ++itr)
+		ids[itr->first] = 2;
 
 	imgdb::imageId_list imgs = db->getImgIdList();
 	for (imgdb::imageId_list::const_iterator itr = imgs.begin(); itr != imgs.end(); ++itr) {
@@ -56,7 +94,7 @@ void check(imgdb::dbSpace* db, int range, const imgdb::imageId_list removed) {
 	if (error) throw imgdb::internal_error("Failed!");
 }
 
-void docheck(int range, int mode, const char* name, const imgdb::imageId_list removed) {
+void docheck(int range, int mode, const char* name, const deleted_t& removed) {
 	imgdb::dbSpace* db = imgdb::dbSpace::load_file(fn, mode);
 	fprintf(stderr, "OK, checking with %s... ", name);
 	check(db, range, removed);
@@ -64,10 +102,10 @@ void docheck(int range, int mode, const char* name, const imgdb::imageId_list re
 	delete db;
 }
 
-bool shouldfail = false;
-void query(imgdb::dbSpace* db, unsigned int id) {
+void query(imgdb::dbSpace* db, unsigned int id, const deleted_t& removed) {
 	fprintf(stderr, "q%d ", id);
-	imgdb::sim_vector res = db->queryImgData(*make_data(id), 8, 0);
+	imgdb::sim_vector res = db->queryImg(imgdb::queryArg(*make_data(id), 8, 0));
+	bool shouldfail = removed.find(id) != removed.end();
 	if (shouldfail != (res[0].id != id || res[0].width != 800+id || res[0].height != 600+id || res[0].score < imgdb::ScoreMax * 9 / 10)) {
 		fprintf(stderr, "%s: id=%lld %dx%d %.1f\n", shouldfail ? "FOUND DELETED IMAGE" : "NOT FOUND", (long long) res[0].id, res[0].width, res[0].height, 1.0*res[0].score/imgdb::ScoreMax);
 		throw imgdb::internal_error("Failed!");
@@ -77,13 +115,15 @@ void query(imgdb::dbSpace* db, unsigned int id) {
 #define CHECK(range, mode) docheck(range, imgdb::dbSpace::mode_ ## mode, #mode, removed)
 #define DELETE(i) \
 	{ fprintf(stderr, "-%lld ", (long long) i); \
-	try { db->removeImage(i); removed.push_back(i); } catch (const imgdb::invalid_id& e) { fprintf(stderr, "!! "); } }
+	try { db->removeImage(i); removed[i]; } catch (const imgdb::invalid_id& e) { fprintf(stderr, "!! "); } }
 #define ADD(i) \
 	{ fprintf(stderr, "%lld ", (long long) i); \
 	try { db->addImageData(make_data(i)); } catch (const imgdb::duplicate_id& e) { fprintf(stderr, "!! "); } }
 
 int main() {
-	imgdb::imageId_list removed;
+	DeltaTest::test();
+
+	deleted_t removed;
 	imgdb::dbSpace::imgDataFromFile("test.jpg", &org);
 	fprintf(stderr, "test.jpg avgl: %f %f %f\n", org.avglf[0], org.avglf[1], org.avglf[2]);
 	unlink(fn);
@@ -142,16 +182,16 @@ int main() {
 	CHECK(2101, simple);
 	db = imgdb::dbSpace::load_file(fn, imgdb::dbSpace::mode_simple);
 	fprintf(stderr, "Querying... ");
-	query(db, 1); query(db, 2101);
-	for (int i = 1; i < 50; i++) query(db, 1 + random() % 2101);
+	query(db, 1, removed); query(db, 314, removed); query(db, 2101, removed); query(db, 2000, removed);
+	for (int i = 1; i < 50; i++) query(db, 1 + random() % 2101, removed);
 	fprintf(stderr, "\nOK. Adding/querying/removing/querying in simple mode.\n");
-	shouldfail=true;query(db, 2103);shouldfail=false;
+	removed[2103];query(db, 2103, removed);removed.erase(2103);
 	ADD(2102); ADD(2103); ADD(2104); ADD(2102);
-	query(db, 2103); query(db, 2104);
+	query(db, 2103, removed); query(db, 2104, removed);
 	DELETE(2103);
-	shouldfail=true;query(db, 2103);shouldfail=false;
+	query(db, 2103, removed);
 	DELETE(2103);
-	ADD(2103);
-	query(db, 2103); query(db, 2104);
+	ADD(2103);removed.erase(2103);
+	query(db, 2103, removed); query(db, 2104, removed);
 	fprintf(stderr, "\nDone!\n");
 }

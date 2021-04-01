@@ -18,7 +18,7 @@ function request_srv($line) {
 	}
 
 	if (!$fp) 
-		return array("fatal" => "Whoops, can't connect to database ;_;", "fatal2" => "Go to <a href='irc://irc.rizon.net/haruhidoujins'>#haruhidoujins@irc.rizon.net</a> to rant.");
+		return array("fatal" => "Whoops, can't connect to database ;_;", "fatal2" => "Go to <a href='irc://irc.rizon.net/iqdb'>#iqdb.rizon.net</a> to rant.");
 
 	#debug("Sending: $line\n");
 	fwrite($fp, "$line\n");
@@ -30,6 +30,7 @@ function request_srv($line) {
 		list($code,$rest) = split(" ", chop($line), 2);
 		#debug("code=$code rest=$rest");
 		switch($code) {
+			case 000: break;
 			case 100: array_push($res["info"], $rest);
 				  break;
 			case 101: list($var,$val) = split("=", $rest, 2);
@@ -66,6 +67,9 @@ function request_match($file, $querysrv, $options = array()) {
 	$numres = $options["numres"];
 	if (!$numres) $numres = 16;
 	$flags = $options["forcegray"] ? 2 : 0;
+	$queryopt = "";
+	if ($options["mask_and"])
+		$queryopt=sprintf("query_opt mask %d %d\n", $options["mask_and"], $options["mask_xor"]);
 	if (is_array($querysrv)) {
 		$res = "";
 		$query = "";
@@ -78,7 +82,7 @@ function request_match($file, $querysrv, $options = array()) {
 			if ($query) $query.=' +';
 			$query.=" $db $rflags $numres";
 		}
-		$query = $res."multi_query$query $file\ndone now\n";
+		$query = $res."${queryopt}multi_query$query $file\ndone now\n";
 		#debug("Doing multi query:\n$query");
 		$res = request_srv($query);
 		if ($res["results"]) $res["results"] = array_slice($res["results"], 0, $numres);
@@ -86,7 +90,7 @@ function request_match($file, $querysrv, $options = array()) {
 		$srv=$services[$services[$querysrv]];
 		$db = $srv["db"];
 		if ($srv["uniqueset"]) $flags |= 8;
-		$query = "count $db\nquery $db $flags $numres $file\ndone now\n";
+		$query = "count $db\n${queryopt}query $db $flags $numres $file\ndone now\n";
 		#debug("Doing simple query for $querysrv:\n$query");
 		$res = request_srv($query);
 	}
@@ -106,6 +110,7 @@ function request_match($file, $querysrv, $options = array()) {
 		if ($srv["process"]) {
 			$arg = array("dbid" => $dbid, "id" => $id, "sim" => $sim, "width" => $width, "height" => $height, "file" => $file);
 			$match = $srv["process"]($arg);
+			if (!is_array($match)) continue;
 			if ($match["err"]) return array('err' => $match["err"]);
 			array_push($result["match"], $match);
 			continue;
@@ -171,18 +176,34 @@ function process_match($match, $ignoremd5 = false, $ignoretag = '') {
 	return $thres;
 }
 
+function resample_thumb($image, $fname, $fqual, $thu_x, $thu_y, $size_x, $size_y) {
+	$thu = @imagecreatetruecolor($thu_x, $thu_y);
+	if (!$thu) return false;
+
+	$res = (($bg = @imagecolorallocate($thu, 255, 255, 255)) &&
+		 @imagefilledrectangle($thu, 0, 0, $thu_x, $thu_y, $bg) &&
+		 @imagecopyresampled($thu, $image, 0, 0, 0, 0, $thu_x, $thu_y, $size_x, $size_y) &&
+		 @imagejpeg($thu, $fname, $fqual));
+	imagedestroy($thu);
+	return $res;
+}
+
 # Save JPEG thumbnail of $org in $img. Return thumb info or error.
 function make_thumb($img, $org) {
-	global $thu_dir, $thudim, $maxdim;
+	global $thu_dir, $thudim, $maxdim, $largedim, $largehnd;
 
 	@$size = getimagesize($img);
 	if (!$size) 
 		return array("err" => "NotImage", "errarg" => array(htmlentities($org)));
 
-	$thumb = array("org" => $org, "size_x" => $size[0], "size_y" => $size[1]);
+	$thumb = array("org" => $org, "size_x" => $size[0], "size_y" => $size[1], "size_kb" => filesize($img)/1024);
 	#debug("size ".join(":", $size));
 	if ($size[0] > $maxdim || $size[1] > $maxdim)
 		return array("err" => "TooBig", "errarg" => array(htmlentities($org), $size[0], $size[1]), "erralt" => "ResizeIt");
+	if ($largehnd && ($size[0] > $largedim || $size[1] > $largedim))
+		$serialize = $largehnd($size[0], $size[1]);
+	else
+		$serialize = false;
 
 	if ($size[2] == IMAGETYPE_GIF)
 		@$image = imagecreatefromgif($img);
@@ -220,24 +241,27 @@ function make_thumb($img, $org) {
 	$thumb["thu_x"] = $thu_x;
 	$thumb["thu_y"] = $thu_y;
 	#debug("thumbnail $thuname: $thu_x $thu_y from $size[0] $size[1]");
+
 	$start = microtime_float();
-	$thu = @imagecreatetruecolor($thu_x, $thu_y);
-	if (!$thu) {
-		@imagedestroy($image);
-		return array("err" => "ThumbErr");
-	}
-	if (!@imagecopyresampled($thu, $image, 0, 0, 0, 0, $thu_x, $thu_y, $size[0], $size[1])) {
-		@imagedestroy($image);
-		@imagedestroy($thu);
-		return array("err" => "ThumbErr");
-	}
-	imagedestroy($image);
-	if (!@imagejpeg($thu, $thumb["name"], 98)) {
-		@imagedestroy($thu);
-		return array("err" => "ThumbErr");
-	}
-	imagedestroy($thu);
+	$res = resample_thumb($image, $thumb["name"], 95, $thu_x, $thu_y, $size[0], $size[1]);
+
+	# Make 128x128 for the DB. Store TmpFile object in $thumb, which causes
+	# the file to get deleted when $thumb is destructed.
+	### Actually not really useful, merely doubles the time to generate thumbs.
+	#if ($res &&
+	#    ($thumb["_dbthu"] = TmpFile::make("/tmp", "db_thu_")) &&
+	#    resample_thumb($image, $thumb["_dbthu"]->name, 98, 128, 128, $size[0], $size[1])) {
+	#	$thumb["dbfname"] = $thumb["_dbthu"]->name;
+	#	chmod($thumb["dbfname"], 0644);
+	#	$thumb["_dbthu"]->close();
+	#}
+
+	@imagedestroy($image);
 	$end = microtime_float();
+
+	// Call destructor if it was an object.
+	$serialize = false;
+	if (!$res) return array("err" => "ThumbErr");
 	$thumb["stats"] = sprintf(" thu %.3fs", $end-$start);
 	return $thumb;
 }
@@ -250,12 +274,48 @@ function produce_xml($match, $thumb, $thres) {
 	if ($thumb["cname"]) $thumburl=$thumb['cname'];
 	echo "<matches preview='$base_url$thumburl' threshold='".$thres["minrel"]."'>\n";
 	foreach ($match as $page) {
-		if ($page['md5']) $m = '" md5="'.$page['md5'].'" width="'.$page['width'].'" height="'.$page['height'].'"';
+		if ($page['md5']) $m = '" md5="'.$page['md5'].'"';
 		else $m = '" id="'.$page['id'].'" name="'.htmlentities($page['eng']).'"';
+		if ($page['width']) $m .= ' width="'.$page['width'].'" height="'.$page['height'].'"';
 		if ($page['fname']) $m .= " preview='$base_url".htmlentities($page['fname'])."'";
-		echo '<match sim="'.$page['sim'].'" service="'.$services[$page['tag']]["site"]."$m/>\n";
+		echo '<match sim="'.$page['sim'].'" service="'.$services[$page['tag']]["site"].$m;
+		if ($page['post'])
+			echo ">".$page['post']."</match>\n";
+		else
+			echo "/>\n";
 	}
 	echo "</matches>";
+}
+
+# Class that automatically cleans up a temp file in its
+# destructor, so it gets cleaned up even if the script is
+# aborted for example.
+class TmpFile {
+	function make($path, $pref, $mode = "rw") {
+		$tmp = new TmpFile();
+		$tmp->name = tempnam($path, $pref);
+		#debug("Got tmp $path $pref name ".$tmp->name);
+		if (!$tmp->name) return false;
+		$tmp->fd = fopen($tmp->name, $mode);
+		if (!$tmp->fd) return false;
+		#debug("Got FD ".$tmp->fd);
+		return $tmp;
+	}
+
+	function close() {
+		#debug("Closing tmpfile ".$this->name." FD ".$this->fd);
+		if ($this->fd) fclose($this->fd);
+		$this->fd = false;
+	}
+
+	private function __construct() { }
+
+	function __destruct() {
+		#debug("Destroying tmp file, name ".$this->name." fd ".$this->fd);
+		$this->close();
+		if ($this->name) unlink($this->name);
+		$this->name = false;
+	}
 }
 
 ?>

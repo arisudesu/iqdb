@@ -32,12 +32,7 @@
 
 /* STL includes */
 #include <algorithm>
-#include <fstream>
-#include <iostream>
 #include <vector>
-
-/* ImageMagick includes */
-#include <magick/api.h>
 
 /* iqdb includes */
 #include "imgdb.h"
@@ -93,7 +88,8 @@ T flipped_endian(T& v) {
 
 //typedef std::priority_queue < KwdFrequencyStruct > kwdFreqPriorityQueue;
 
-inline void imageIdIndex_map::unmap() {
+template<bool is_simple>
+inline void imageIdIndex_map<is_simple>::unmap() {
 	if (!m_base) return;
 	if (munmap(m_base, m_length))
 		fprintf(stderr, "WARNING: Could not unmap %zd bytes of memory.\n", m_length);
@@ -132,27 +128,27 @@ void imageIdIndex_list<is_simple, false>::resize(size_t s) {
 }
 
 template<>
-imageIdIndex_map imageIdIndex_list<true, false>::map_all(bool writable) {
+imageIdIndex_map<true> imageIdIndex_list<true, false>::map_all(bool writable) {
 //fprintf(stderr, "Mapping... write=%d size=%zd+%zd=%zd/%zd. %zd pages. ", writable, m_size, m_tail.size(), size(), m_capacity, m_pages.size());
-	if (!writable && !size()) return imageIdIndex_map();
+	if (!writable && !size()) return imageIdIndex_map<true>();
 	if (!writable && m_pages.empty()) {
 //fprintf(stderr, "Using fake map of tail data.\n");
-		return imageIdIndex_map();
+		return imageIdIndex_map<true>();
 	}
 	imageIdPage& page = m_pages.front();
 	size_t length = page.second + m_baseofs;
 //fprintf(stderr, "Directly mapping %zd bytes. ", length);
 	void* base = mmap(NULL, length, PROT_READ|PROT_WRITE, MAP_SHARED, m_fd, page.first);
 	if (base == MAP_FAILED) throw memory_error("Failed to mmap bucket.");
-	return imageIdIndex_map(base, (image_id_index*)(((char*)base)+m_baseofs), m_size, length);
+	return imageIdIndex_map<true>(base, (size_t*)(((char*)base)+m_baseofs), (size_t*)(((char*)base)+m_baseofs)+m_size, length);
 }
 
 template<>
-imageIdIndex_map imageIdIndex_list<false, false>::map_all(bool writable) {
-	if (!writable && !size()) return imageIdIndex_map();
+imageIdIndex_map<false> imageIdIndex_list<false, false>::map_all(bool writable) {
+	if (!writable && !size()) return imageIdIndex_map<false>();
 	if (!writable && m_pages.empty()) {
 //fprintf(stderr, "Using fake map of tail data.\n");
-		return imageIdIndex_map();
+		return imageIdIndex_map<false>();
 	}
 
 	while (writable && !m_tail.empty()) page_out();
@@ -164,7 +160,7 @@ imageIdIndex_map imageIdIndex_list<false, false>::map_all(bool writable) {
 	void* base = mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
 	if (base == MAP_FAILED) throw memory_error("Failed to mmap bucket.");
 
-	imageIdIndex_map mapret(base, (image_id_index*)base, m_capacity, len);
+	imageIdIndex_map<false> mapret(base, (image_id_index*)base, (image_id_index*)base+m_capacity, len);
 	char* chunk = (char*) base;
 	for (page_list::iterator itr = m_pages.begin(); itr != m_pages.end(); ++itr) {
 //fprintf(stderr, "Using %zd bytes from ofs %llx. ", itr->second, (long long int) itr->first);
@@ -230,20 +226,45 @@ void imageIdIndex_list<false, false>::remove(image_id_index i) {
 		m_tail.pop_back();
 		return;
 	}
-	AutoImageIdIndex_map map(map_all(false));
-	size_t ofs;
-	for (ofs = 0; ofs < m_size && map[ofs] != i; ofs++);
-	if (ofs < m_size) {
-		if (map[ofs] != i) throw internal_error("Huh???");
+	AutoImageIdIndex_map<false> map(map_all(false));
+	imageIdIndex_map<false>::iterator mItr = map.begin();
+	while (mItr != map.end() && *mItr != i) ++mItr;
+	if (mItr != map.end()) {
+		if (*mItr != i) throw internal_error("Huh???");
 //fprintf(stderr, "Found at %zd/%zd.\n", ofs, m_size);
 		if (!m_tail.empty()) {
-			map[ofs] = m_tail.back();
+			*mItr = m_tail.back();
 			m_tail.pop_back();
 		} else {
-			map[ofs] = map[--m_size];
+			imageIdIndex_map<false>::iterator last = map.end();
+			--last;
+			*mItr = *last;
+			m_size--;
 		}
 	}
 //else fprintf(stderr, "NOT FOUND!!!\n");
+}
+
+//template<>
+void imageIdIndex_list<true, true>::set_base() {
+	if (!m_base.empty()) return;
+
+#ifdef USE_DELTA_QUEUE
+	if (m_tail.base_size() * 17 / 16 + 16 < m_tail.base_capacity()) {
+		container copy;
+		copy.reserve(m_tail.base_size(), true);
+		for (container::iterator itr = m_tail.begin(); itr != m_tail.end(); ++itr)
+			copy.push_back(*itr);
+
+		m_base.swap(copy);
+		copy = container();
+		m_tail.swap(copy);
+	} else {
+		m_base.swap(m_tail);
+	}
+#else
+	m_base.swap(m_tail);
+#endif
 }
 
 // Specializations accessing images as SigStruct* or size_t map, and imageIdIndex_map as imageId or index map.
@@ -382,15 +403,21 @@ void dbSpaceCommon::sigFromImage(Image* image, imageId id, ImgData* sig) {
 	sig->height = image->rows;
 
 	//resize_image = SampleImage(image, 128, 128, &exception);
-	AutoImage resize_image(ResizeImage(image, 128, 128, TriangleFilter, 1.0, &exception));
-	if (!resize_image)
-		throw image_error("Unable to resize image.");
+	Image* resize_image = NULL;
+	if (image->columns != 128 || image->rows != 128) {
+		resize_image = ResizeImage(image, 128, 128, TriangleFilter, 1.0, &exception);
+		if (!resize_image)
+			throw image_error("Unable to resize image.");
+		image = resize_image;
+	}
+	// To clean up resize_image on return or exceptions.
+	AutoImage resize_image_auto(resize_image);
 
 	unsigned char rchan[16384];
 	unsigned char gchan[16384];
 	unsigned char bchan[16384];
 
-	const PixelPacket *pixel_cache = AcquireImagePixels(&resize_image, 0, 0, 128, 128, &exception);
+	const PixelPacket *pixel_cache = AcquireImagePixels(image, 0, 0, 128, 128, &exception);
 
 	for (int idx = 0; idx < 16384; idx++) {
 		rchan[idx] = pixel_cache->red >> (QuantumDepth - 8);
@@ -405,9 +432,9 @@ void dbSpaceCommon::sigFromImage(Image* image, imageId id, ImgData* sig) {
 }
 
 template<typename B>
-inline void dbSpaceCommon::bucket_set<B>::add(const ImgData* nsig, size_t index) {
+inline void dbSpaceCommon::bucket_set<B>::add(const ImgData& nsig, size_t index) {
 	lumin_int avgl;
-	SigStruct::avglf2i(nsig->avglf, avgl);
+	SigStruct::avglf2i(nsig.avglf, avgl);
 	for (int i = 0; i < NUM_COEFS; i++) {	// populate buckets
 
 
@@ -416,40 +443,40 @@ inline void dbSpaceCommon::bucket_set<B>::add(const ImgData* nsig, size_t index)
 		// sig[i] never 0
 		int x, t;
 
-		x = nsig->sig1[i];
+		x = nsig.sig1[i];
 		t = (x < 0);		/* t = 1 if x neg else 0 */
 		/* x - 0 ^ 0 = x; i - 1 ^ 0b111..1111 = 2-compl(x) = -x */
 		x = (x - t) ^ -t;
-		buckets[0][t][x].add(nsig->id, index);
+		buckets[0][t][x].add(nsig.id, index);
 
 		if (is_grayscale(avg))
 			continue;	// ignore I/Q coeff's if chrominance too low
 
-		x = nsig->sig2[i];
+		x = nsig.sig2[i];
 		t = (x < 0);
 		x = (x - t) ^ -t;
-		buckets[1][t][x].add(nsig->id, index);
+		buckets[1][t][x].add(nsig.id, index);
 
-		x = nsig->sig3[i];
+		x = nsig.sig3[i];
 		t = (x < 0);
 		x = (x - t) ^ -t;
-		buckets[2][t][x].add(nsig->id, index);
+		buckets[2][t][x].add(nsig.id, index);
 
 		should not fail
 
 #else //FAST_POW_GEERT
 		//imageId_array3 (imgbuckets = dbSpace[dbId]->(imgbuckets;
-		if (nsig->sig1[i]>0) buckets[0][0][nsig->sig1[i]].add(nsig->id, index);
-		if (nsig->sig1[i]<0) buckets[0][1][-nsig->sig1[i]].add(nsig->id, index);
+		if (nsig.sig1[i]>0) buckets[0][0][nsig.sig1[i]].add(nsig.id, index);
+		if (nsig.sig1[i]<0) buckets[0][1][-nsig.sig1[i]].add(nsig.id, index);
 
 		if (is_grayscale(avgl))
 			continue;	// ignore I/Q coeff's if chrominance too low
 
-		if (nsig->sig2[i]>0) buckets[1][0][nsig->sig2[i]].add(nsig->id, index);
-		if (nsig->sig2[i]<0) buckets[1][1][-nsig->sig2[i]].add(nsig->id, index);
+		if (nsig.sig2[i]>0) buckets[1][0][nsig.sig2[i]].add(nsig.id, index);
+		if (nsig.sig2[i]<0) buckets[1][1][-nsig.sig2[i]].add(nsig.id, index);
 
-		if (nsig->sig3[i]>0) buckets[2][0][nsig->sig3[i]].add(nsig->id, index);
-		if (nsig->sig3[i]<0) buckets[2][1][-nsig->sig3[i]].add(nsig->id, index);
+		if (nsig.sig3[i]>0) buckets[2][0][nsig.sig3[i]].add(nsig.id, index);
+		if (nsig.sig3[i]<0) buckets[2][1][-nsig.sig3[i]].add(nsig.id, index);
 
 #endif //FAST_POW_GEERT
 
@@ -491,7 +518,7 @@ void dbSpaceImpl<false>::addImageData(const ImgData* img) {
 	// insert into ids bloom filter
 	//imgIdsFilter->insert(id);
 
-	imgbuckets.add(img, m_nextIndex++);
+	imgbuckets.add(*img, m_nextIndex++);
 }
 
 template<>
@@ -518,7 +545,7 @@ void dbSpaceImpl<true>::addImageData(const ImgData* img) {
 		write_sig_cache(ofs, img);
 	}
 
-	imgbuckets.add(img, ind);
+	imgbuckets.add(*img, ind);
 }
 
 void dbSpaceAlter::addImageData(const ImgData* img) {
@@ -531,9 +558,9 @@ void dbSpaceAlter::addImageData(const ImgData* img) {
 		m_deleted.pop_back();
 	} else {
 		ind = m_images.size();
-		if (m_imgOff + (ind + 1) * sizeof(imageId) >= m_sigOff) {
+		if (m_imgOff + ((off_t)ind + 1) * (off_t)sizeof(imageId) >= m_sigOff) {
 			resize_header();
-			if (m_imgOff + (ind + 1) * sizeof(imageId) >= m_sigOff)
+			if (m_imgOff + ((off_t)ind + 1) * (off_t)sizeof(imageId) >= m_sigOff)
 				throw internal_error("resize_header failed!");
 		}
 	}
@@ -545,7 +572,7 @@ void dbSpaceAlter::addImageData(const ImgData* img) {
 	m_f->seekp(m_sigOff + ind * sizeof(ImgData));
 	m_f->write(*img);
 
-	m_buckets.add(img, ind);
+	m_buckets.add(*img, ind);
 	m_images[img->id] = ind;
 }
 
@@ -663,10 +690,8 @@ fprintf(stderr, "has %zd images at %llx. ", numImg, (long long)firstOff);
 
 	// read bucket sizes and reserve space so that buckets do not
 	// waste memory due to exponential growth of std::vector
-	for (int c = 0; c < 3; c++)
-		for (int pn = 0; pn < 2; pn++)
-			for (int i = 0; i < 16384; i++)
-				imgbuckets[c][pn][i].reserve(FLIPPED(f.read<size_t>()));
+	for (typename buckets_t::iterator itr = imgbuckets.begin(); itr != imgbuckets.end(); ++itr)
+		itr->reserve(FLIPPED(f.read<size_t>()));
 fprintf(stderr, "bucket sizes done at %llx... ", (long long)firstOff);
 
 	// read IDs (for verification only)
@@ -684,7 +709,7 @@ fprintf(stderr, "bucket sizes done at %llx... ", (long long)firstOff);
 		FLIP(sig.id); FLIP(sig.width); FLIP(sig.height); FLIP(sig.avglf[0]); FLIP(sig.avglf[1]); FLIP(sig.avglf[2]);
 
 		size_t ind = m_nextIndex++;
-		imgbuckets.add(&sig, ind);
+		imgbuckets.add(sig, ind);
 
 		if (ids[ind] != sig.id)
 			if (is_simple)
@@ -720,10 +745,8 @@ fprintf(stderr, "bucket sizes done at %llx... ", (long long)firstOff);
 if (is_disk_db) fprintf(stderr, "map size: %lld... ", (long long int) lseek(imgbuckets[0][0][0].fd(), 0, SEEK_CUR));
 	}
 
-	for (int c = 0; c < 3; c++)
-		for (int pn = 0; pn < 2; pn++)
-			for (int i = 0; i < 16384; i++)
-				imgbuckets[c][pn][i].set_base();
+	for (typename buckets_t::iterator itr = imgbuckets.begin(); itr != imgbuckets.end(); ++itr)
+		itr->set_base();
 	m_bucketsValid = true;
 fprintf(stderr, "complete!\n");
 	f.close();
@@ -731,6 +754,7 @@ fprintf(stderr, "complete!\n");
 
 void dbSpaceAlter::load(const char* filename) {
 	m_f = new db_fstream(filename);
+	m_fname = filename;
 	try {
 		if (!m_f->is_open()) {
 			// Instead of replicating code here to create the basic file structure, we'll just make a dummy DB.
@@ -754,10 +778,8 @@ fprintf(stderr, "Loading db header (cur ver)... ");
 
 fprintf(stderr, "has %zd images. ", numImg);
 		// read bucket sizes
-		for (int c = 0; c < 3; c++)
-			for (int pn = 0; pn < 2; pn++)
-				for (int i = 0; i < 16384; i++)
-					m_buckets[c][pn][i].size = FLIPPED(m_f->read<size_t>());
+		for (buckets_t::iterator itr = m_buckets.begin(); itr != m_buckets.end(); ++itr)
+			itr->size = FLIPPED(m_f->read<size_t>());
 
 		// read IDs
 		m_imgOff = m_f->tellg();
@@ -770,16 +792,23 @@ fprintf(stderr, "complete!\n");
 		if (m_f) {
 			if (m_f->is_open()) m_f->close();
 			delete m_f;
+			m_fname.clear();
 		}
 		throw;
 	}
 }
 
-template<bool is_simple>
-void dbSpaceImpl<is_simple>::load_stream_old(db_ifstream& f, uint version) {
+template<>
+void dbSpaceImpl<true>::load_stream_old(db_ifstream& f, uint version) {
+	throw usage_error("Not supported in read-only mode.");
+}
+
+template<>
+void dbSpaceImpl<false>::load_stream_old(db_ifstream& f, uint version) {
 #ifdef NO_SUPPORT_OLD_VER
 	throw data_error("Cannot load old database version: NO_SUPPORT_OLD_VER was set.");
 #else
+	static const bool is_simple = false;
 fprintf(stderr, "Loading db (old ver)... ");
 
 	imageId id;
@@ -794,20 +823,18 @@ fprintf(stderr, "Loading db (old ver)... ");
 	// fast-forward to image count
 	db_ifstream::pos_type old_pos = f.tellg();
 	m_bucketsValid = true;
-	for (int c = 0; c < 3; c++)
-		for (int pn = 0; pn < 2; pn++)
-			for (int i = 0; i < 16384; i++) {
-				sz = FLIPPED(f.read<int>());
-				if (sz == ~uint()) {
-					if (c || pn || i) throw data_error("No-bucket indicator too late.");
-					m_bucketsValid = false;
+	for (buckets_t::iterator itr = imgbuckets.begin(); itr != imgbuckets.end(); ++itr) {
+		sz = FLIPPED(f.read<int>());
+		if (sz == ~uint()) {
+			if (itr != imgbuckets.begin()) throw data_error("No-bucket indicator too late.");
+				m_bucketsValid = false;
 fprintf(stderr, "NO BUCKETS VERSION! ");
-					sz = FLIPPED(f.read<int>());
-				}
-				if (m_bucketsValid)
-					f.seekg(sz * sizeof(imageId), f.cur);
-			}
-	typename image_map::size_type szt;
+			sz = FLIPPED(f.read<int>());
+		}
+		if (m_bucketsValid)
+			f.seekg(sz * sizeof(imageId), f.cur);
+	}
+	image_map::size_type szt;
 	f.read((char *) &(szt), sizeof(szt));
 	FLIP(szt);
 	f.seekg(old_pos);
@@ -818,46 +845,43 @@ fprintf(stderr, "has %zd images. ", szt);
 	if (!m_bucketsValid)
 		f.read((char *) &(sz), sizeof(int));
 
-	for (int c = 0; c < 3; c++)
-		for (int pn = 0; pn < 2; pn++)
-			for (int i = 0; i < 16384; i++) {
-				f.read((char *) &(sz), sizeof(int));
-				FLIP(sz);
-				if (!sz) continue;
+	for (buckets_t::iterator itr = imgbuckets.begin(); itr != imgbuckets.end(); ++itr) {
+		f.read((char *) &(sz), sizeof(int));
+		FLIP(sz);
+		if (!sz) continue;
 
-				bucket_type& bucket = imgbuckets[c][pn][i];
-				if (!m_bucketsValid) {
-					bucket.reserve(sz);
-					continue;
-				}
+		if (!m_bucketsValid) {
+			itr->reserve(sz);
+			continue;
+		}
 
-				if (is_simple && sz > szt) {
+		if (is_simple && sz > szt) {
 //fprintf(stderr, "Bucket %d:%d:%d has %d/%zd, ignoring.\n", c, pn, i, sz, szt*10);
-					f.seekg(sz * sizeof(imageId), f.cur);
-					continue;
-				}
+			f.seekg(sz * sizeof(imageId), f.cur);
+			continue;
+		}
 
 //fprintf(stdout, "c=%d:p=%d:%d=%d images\n", c, pn, i, sz);
-				size_t szp = is_simple ? sz : sz & ~pageImgMask;
-				if (szp) {
-					if (sz - szp >= bucket.threshold) szp = sz;
-					bucket.resize(szp);
-					AutoImageIdIndex_map map(bucket.map_all(true));
+		size_t szp = is_simple ? sz : sz & ~pageImgMask;
+		if (szp) {
+			if (sz - szp >= itr->threshold) szp = sz;
+			itr->resize(szp);
+			AutoImageIdIndex_map<is_simple> map(itr->map_all(true));
 //fprintf(stderr, "Mapped bucket to %d bytes at %p(%p). Reading to %p. ", map.m_length, map.m_base, map.m_img, &(map[0]));
-					f.read((char *) &(map[0]), szp * sizeof(imageId));
-					for (size_t k = 0; k < szp; k++)
-						FLIP(map[k].id);
-					bucket.loaded(szp);
-					sz -= szp;
-				}
-				for (size_t k = 0; k < sz; k++) {
-					f.read((char *) &id, sizeof(imageId));
-					FLIP(id);
-					bucket.push_back(id);
-				}
+			f.read((char *) &*map.begin(), szp * sizeof(imageId));
+			itr->loaded(szp);
+			for (idIndexIterator itr(map.begin(), *this); itr != map.end(); ++itr)
+				FLIP(itr->id);
+			sz -= szp;
+		}
+		for (size_t k = 0; k < sz; k++) {
+			f.read((char *) &id, sizeof(imageId));
+			FLIP(id);
+			itr->push_back(id);
+		}
 //fprintf(stderr, "Bucket has %zd capacity paged, %zd in pages, %zd in tail.\n", bucket.paged_capacity(), bucket.paged_size(), bucket.tail_size());
 //fprintf(stderr, "Done.\n");
-			}
+	}
 fprintf(stderr, "buckets done... ");
 
 	// read sigs
@@ -868,7 +892,7 @@ if (version == SRZ_V0_6_0) fprintf(stderr, "converting from v6.0... ");
 
 	if (is_simple) m_info.resize(szt);
 
-		for (typename image_map::size_type k = 0; k < szt; k++) {
+		for (image_map::size_type k = 0; k < szt; k++) {
 			ImgData sig;
 
 			if (version == SRZ_V0_6_0) {
@@ -889,7 +913,7 @@ if (version == SRZ_V0_6_0) fprintf(stderr, "converting from v6.0... ");
 
 			size_t ind = m_nextIndex++;
 			if (!m_bucketsValid)
-				imgbuckets.add(&sig, ind);
+				imgbuckets.add(sig, ind);
 
 			if (is_simple) {
 				m_info[ind].id = sig.id;
@@ -944,10 +968,8 @@ if (version == SRZ_V0_6_0) fprintf(stderr, "converting from v6.0... ");
 if (is_disk_db) fprintf(stderr, "map size: %lld... ", (long long int) lseek(imgbuckets[0][0][0].fd(), 0, SEEK_CUR));
 	}
 
-	for (int c = 0; c < 3; c++)
-		for (int pn = 0; pn < 2; pn++)
-			for (int i = 0; i < 16384; i++)
-				imgbuckets[c][pn][i].set_base();
+	for (buckets_t::iterator itr = imgbuckets.begin(); itr != imgbuckets.end(); ++itr)
+		itr->set_base();
 	m_bucketsValid = true;
 fprintf(stderr, "complete!\n");
 	f.close();
@@ -992,7 +1014,7 @@ if (is_disk_db) fprintf(stderr, "map size: %lld... ", (long long int) lseek(imgb
 	f.write(m_images.size());
 	off_t firstOff = f.tellp();
 	firstOff += m_images.size() * sizeof(imageId);	// cur pos plus imageId per image
-	firstOff += numbuckets * sizeof(size_t);	// plus size_t per bucket
+	firstOff += imgbuckets.count() * sizeof(size_t);	// plus size_t per bucket
 
 	// leave space for 1024 new IDs
 	firstOff = (firstOff + 1024 * sizeof(imageId));
@@ -1000,10 +1022,8 @@ fprintf(stderr, "sig off: %llx... ", (long long int) firstOff);
 	f.write(firstOff);
 
 	// save bucket sizes
-	for (int c = 0; c < 3; c++)
-		for (int pn = 0; pn < 2; pn++)
-			for (int i = 0; i < 16384; i++)
-				f.write(imgbuckets[c][pn][i].size());
+	for (buckets_t::iterator itr = imgbuckets.begin(); itr != imgbuckets.end(); ++itr)
+		f.write(itr->size());
 
 	// save IDs
 	for (imageIterator it = image_begin(); it != image_end(); it++)
@@ -1067,6 +1087,8 @@ void dbSpaceAlter::move_deleted() {
 
 void dbSpaceAlter::save_file(const char* filename) {
 	if (!m_f) return;
+	if (filename && m_fname != filename)
+		throw param_error("Cannot save to different filename.");
 
 fprintf(stderr, "saving file, %zd deleted images... ", m_deleted.size());
 	if (!m_deleted.empty())
@@ -1095,10 +1117,7 @@ fprintf(stderr, "saving header... ");
 	m_f->seekp(m_hdrOff);
 	m_f->write(m_images.size());
 	m_f->write(m_sigOff);
-	for (int c = 0; c < 3; c++)
-		for (int pn = 0; pn < 2; pn++)
-			for (int i = 0; i < 16384; i++)
-				m_f->write(m_buckets[c][pn][i]);
+	m_f->write(m_buckets);
 
 fprintf(stderr, "done!\n");
 	m_f->flush();
@@ -1138,56 +1157,48 @@ struct sim_result : public index_iterator<is_simple>::base_type {
 };
 
 template<bool is_simple>
+inline bool dbSpaceImpl<is_simple>::skip_image(const imageIterator& itr, const queryArg& query) {
+	return
+		(is_simple && !itr.avgl()[0])
+		||
+		((query.flags & flag_mask) && ((itr.mask() & query.mask_and) != query.mask_xor))
+	;
+}
+
+template<bool is_simple>
 template<int num_colors>
-sim_vector dbSpaceImpl<is_simple>::do_query(const Idx* sig1, const Idx* sig2, const Idx* sig3, const lumin_int& avgl, unsigned int numres, int flags, bloom_filter* bfilter, bool fast) {
+sim_vector dbSpaceImpl<is_simple>::do_query(queryArg q) {
 	int c;
-	const Idx *sig[3] = { sig1, sig2, sig3 };
 	Score scale = 0;
-	int sketch = flags & flag_sketch ? 1 : 0;
-//fprintf(stderr, "In do_query<%s,%d>.\n", is_simple?"true":"false", num_colors);
+	int sketch = q.flags & flag_sketch ? 1 : 0;
+//fprintf(stderr, is_simple?"In do_query<true%d>.\n":"In do_query<false%d>.\n", num_colors);
 
 	if (!m_bucketsValid) throw usage_error("Can't query with invalid buckets.");
 
 	size_t count = m_nextIndex;
 	AutoCleanArray<Score> scores(new Score[count]);
 
-	if (bfilter) { // make sure images not on filter are penalized
-		throw usage_error("Filtering not supported.");
-		/*
-		for (sigMap::iterator sit = sigs.begin(); sit != sigs.end(); sit++) {
-
-			if (!bfilter->contains((*sit).first)) { // image doesnt have keyword, just give it a terrible score
-				scores[sit->second->get_index] = ScoreMax;
-			} else { // ok, image content should be taken into account
-				for (c = 0; c < cnum; c++) {
-					scores[sit->second->get_index] += (((DScore)weights[sketch][0][c]) * abs(info[sit->second->get_index].second[c] - avgl[c])) >> ScoreScale;
-				}
-			}
-		}
-		delete bfilter;
-		*/
-
-	} else { // search all images 
-		for (imageIterator itr = image_begin(); itr != image_end(); ++itr) {
-			scores[itr.index()] = 0;
-			for (c = 0; c < num_colors; c++)
-				scores[itr.index()] += (((DScore)weights[sketch][0][c]) * abs(itr.avgl()[c] - avgl[c])) >> ScoreScale;
-		}
+	// Luminance score (DC coefficient).
+	for (imageIterator itr = image_begin(); itr != image_end(); ++itr) {
+		Score s = 0;
+		for (c = 0; c < num_colors; c++)
+			s += (((DScore)weights[sketch][0][c]) * abs(itr.avgl()[c] - q.avgl[c])) >> ScoreScale;
+		scores[itr.index()] = s;
 	}
 
-	for (int b = fast ? NUM_COEFS : 0; b < NUM_COEFS; b++) {	// for every coef on a sig
+	for (int b = (q.flags & flag_fast) ? NUM_COEFS : 0; b < NUM_COEFS; b++) {	// for every coef on a sig
 		for (c = 0; c < num_colors; c++) {
 			int idx;
-			bucket_type& bucket = imgbuckets.at(c, sig[c][b], &idx);
+			bucket_type& bucket = imgbuckets.at(c, q.sig[c][b], &idx);
 			if (bucket.empty()) continue;
-			if (flags & flag_nocommon && bucket.size() > count / 10) continue;
+			if (q.flags & flag_nocommon && bucket.size() > count / 10) continue;
 
 			Score weight = weights[sketch][imgBin[idx]][c]; 
 //fprintf(stderr, "%d:%d=%d has %zd=%d, ", b, c, sig[c][b], dbSpace[dbId]->imgbuckets[c][pn][idx].size(), weight);
 			scale -= weight;
 
 			// update the score of every image which has this coef
-			AutoImageIdIndex_map map(bucket.map_all(false));
+			AutoImageIdIndex_map<is_simple> map(bucket.map_all(false));
 			for (idIndexIterator itr(map.begin(), *this); itr != map.end(); ++itr)
 				scores[itr.index()] -= weight;
 			for (idIndexTailIterator itr(bucket.tail().begin(), *this); itr != bucket.tail().end(); ++itr)
@@ -1205,26 +1216,27 @@ sim_vector dbSpaceImpl<is_simple>::do_query(const Idx* sig1, const Idx* sig2, co
 
 	typedef std::map<int, size_t> set_map;
 	set_map sets;
-	unsigned int need = numres;
+	unsigned int need = q.numres;
 
 	// Fill up the numres-bounded priority queue (largest at top):
-	for (unsigned int cnt = 0; cnt < need && itr != image_end(); cnt++, ++itr) {
-		if (is_simple && !itr.avgl()[0]) continue;
+	while (pqResults.size() < need && itr != image_end()) {
+		if (skip_image(itr, q)) { ++itr; continue; }
 
 		pqResults.push(sim_result<is_simple>(scores[itr.index()], itr));
 
-		if (flags & flag_uniqueset) //{
+		if (q.flags & flag_uniqueset) //{
 			need += ++sets[itr.set()] > 1;
 //imageIterator top(pqResults.top(), *this);fprintf(stderr, "Added id=%08lx score=%.2f set=%x, now need %d. Worst is id %08lx score %.2f set %x has %zd\n", itr.id(), (double)scores[itr.index()]/ScoreMax, itr.set(), need, top.id(), (double)pqResults.top().score/ScoreMax, top.set(), sets[top.set()]); }
+		++itr;
 	}
 
 	for (; itr != image_end(); ++itr) {
 		// only consider if not ignored due to keywords and if is a better match than the current worst match
 		if (scores[itr.index()] < pqResults.top().score) {
-			if (is_simple && !itr.avgl()[0]) continue;
+			if (skip_image(itr, q)) continue;
 
 			// Make room by dropping largest entry:
-			if (flags & flag_uniqueset) {
+			if (q.flags & flag_uniqueset) {
 				pqResults.push(sim_result<is_simple>(scores[itr.index()], itr));
 				need += ++sets[itr.set()] > 1;
 //imageIterator top(pqResults.top(), *this);fprintf(stderr, "Added id=%08lx score=%.2f set=%x, now need %d. Worst is id %08lx score %.2f set %x has %zd\n", itr.id(), (double)scores[itr.index()]/ScoreMax, itr.set(), need, top.id(), (double)pqResults.top().score/ScoreMax, top.set(), sets[top.set()]);
@@ -1245,12 +1257,10 @@ sim_vector dbSpaceImpl<is_simple>::do_query(const Idx* sig1, const Idx* sig2, co
 	scale = ((DScore) ScoreMax) * ScoreMax / scale;
 	while (!pqResults.empty()) {
 		const sim_result<is_simple>& curResTmp = pqResults.top();
-		if (curResTmp.score == ScoreMax)
-			break;
 
 		imageIterator itr(curResTmp, *this);
 //fprintf(stderr, "Candidate %08lx = %.2f, set %x has %zd.\n", itr.id(), (double)curResTmp.score/ScoreMax, itr.set(), sets[itr.set()]);
-		if (!(flags && flag_uniqueset) || sets[itr.set()]-- < 2)
+		if (!(q.flags & flag_uniqueset) || sets[itr.set()]-- < 2)
 			V.push_back(sim_value(itr.id(), (((DScore)curResTmp.score) * 100 * scale) >> ScoreScale, itr.width(), itr.height()));
 //else fprintf(stderr, "Skipped!\n");
 		pqResults.pop();
@@ -1263,52 +1273,11 @@ sim_vector dbSpaceImpl<is_simple>::do_query(const Idx* sig1, const Idx* sig2, co
 
 template<bool is_simple>
 inline sim_vector
-dbSpaceImpl<is_simple>::queryImgDataFiltered(const Idx* sig1, const Idx* sig2, const Idx* sig3, const lumin_int& avgl, unsigned int numres, int flags, bloom_filter* bfilter, bool fast) {
-	if ((flags & flag_grayscale) || is_grayscale(avgl))
-		return do_query<1>(sig1, sig2, sig3, avgl, numres, flags, bfilter, fast);
+dbSpaceImpl<is_simple>::queryImg(const queryArg& query) {
+	if ((query.flags & flag_grayscale) || is_grayscale(query.avgl))
+		return do_query<1>(query);
 	else
-		return do_query<3>(sig1, sig2, sig3, avgl, numres, flags, bfilter, fast);
-}
-
-template<bool is_simple>
-sim_vector dbSpaceImpl<is_simple>::queryImgDataFiltered(const ImgData& img, unsigned int numres, int flags, bloom_filter* bfilter, bool fast) {
-	lumin_int avgl;
-	SigStruct::avglf2i(img.avglf, avgl);
-	return queryImgDataFiltered(img.sig1, img.sig2, img.sig3, avgl, numres, flags, bfilter, fast);
-}
-
-/* sig1,2,3 are int arrays of length NUM_COEFS 
-avgl is the average luminance
-numres is the max number of results
-sketch (0 or 1) tells which set of weights to use
- */
-template<bool is_simple>
-sim_vector dbSpaceImpl<is_simple>::queryImgData(const Idx* sig1, const Idx* sig2, const Idx* sig3, const lumin_int& avgl, unsigned int numres, int flags) {
-	return queryImgDataFiltered(sig1, sig2, sig3, avgl, numres, flags, 0, false);
-}
-
-template<bool is_simple>
-sim_vector dbSpaceImpl<is_simple>::queryImgData(const ImgData& img, unsigned int numres, int flags) {
-	lumin_int avgl;
-	SigStruct::avglf2i(img.avglf, avgl);
-	return queryImgData(img.sig1, img.sig2, img.sig3, avgl, numres, flags);
-}
-
-template<bool is_simple>
-sim_vector dbSpaceImpl<is_simple>::queryImgFile(const char* filename, unsigned int numres, int flags) {
-	AutoImage image(imageFromFile(filename));
-fprintf(stderr, "Loaded image %s... ", filename);
-	ImgData sig;
-	sigFromImage(&image, 0, &sig);
-fprintf(stderr, "got sig, flags = %d.\n", flags);
-	return queryImgDataFiltered(sig, numres, flags, 0, false);
-}
-
-template<bool is_simple>
-sim_vector dbSpaceImpl<is_simple>::queryImgDataFast(const ImgData& img, unsigned int numres, int flags) {
-	lumin_int avgl;
-	SigStruct::avglf2i(img.avglf, avgl);
-	return queryImgDataFiltered(img.sig1, img.sig2, img.sig3, avgl, numres, flags, NULL, true);
+		return do_query<3>(query);
 }
 
 // cluster by similarity. Returns list of list of imageIds (img ids)
@@ -1353,72 +1322,12 @@ imageId_list_2 clusterSim(const int dbId, float thresd, int fast = 0) {
 }
  */
 
-template<bool is_simple>
-sim_vector dbSpaceImpl<is_simple>::queryImgRandom(unsigned int numres, int flags) {
-	/*query for images similar to the one that has this id
-	numres is the maximum number of results
-	 */
-	throw usage_error("Not supported.");
-	/*
-
-		sim_vector Vres;
-		size_t sz = validate_dbid(dbId)->sigs.size();
-		int_hashset includedIds;
-		sigIterator it = dbSpace[dbId]->sigs.begin();
-		for (size_t var = 0; var < std::min<size_t>(sz, numres); ) { // var goes from 0 to numres
-			size_t rint = rand()%(sz);
-			for(size_t pqp =0; pqp < rint; pqp++) {
-				it ++;			
-				if (it == dbSpace[dbId]->sigs.end()) {
-					it = dbSpace[dbId]->sigs.begin();
-					continue;
-				}
-			}
-
-			int_hashset::iterator itr = includedIds.find(it->first);
-			if (itr == includedIds.end()) { // havent added this random result yet
-				Vres.push_back(std::make_pair(it->first, (double)0));
-				includedIds.insert((*it).first);
-				++var;
-			}
-		}
-		return Vres;
-	*/
-}
-
-template<bool is_simple>
-sim_vector dbSpaceImpl<is_simple>::queryImgID(imageId id, unsigned int numres, int flags) {
-	/*query for images similar to the one that has this id
-	numres is the maximum number of results
-	 */
-
-	return queryImgData(get_sig_from_cache(id), numres, flags);
-}
-
-template<bool is_simple>
-sim_vector dbSpaceImpl<is_simple>::queryImgIDFiltered(imageId id, unsigned int numres, int flags, bloom_filter* bf) {
-	/*query for images similar to the one that has this id
-	numres is the maximum number of results
-	 */
-
-	return queryImgDataFiltered(get_sig_from_cache(id), numres, flags, bf, false);
-}
-
-template<bool is_simple>
-sim_vector dbSpaceImpl<is_simple>::queryImgIDFast(imageId id, unsigned int numres, int flags) {
-	/*query for images similar to the one that has this id
-	numres is the maximum number of results
-	 */
-
-	return queryImgDataFast(get_sig_from_cache(id), numres, flags);
-}
-
 template<>
 void dbSpaceImpl<false>::removeImage(imageId id) {
 	SigStruct* isig = find(id).sig();
 	ImgData nsig;
 	read_sig_cache(isig->cacheOfs, &nsig);
-	imgbuckets.remove(&nsig);
+	imgbuckets.remove(nsig);
 	m_bucketsValid = false;
 	m_images.erase(id);
 	delete isig;
@@ -1439,23 +1348,23 @@ void dbSpaceAlter::removeImage(imageId id) {
 }
 
 template<typename B>
-inline void dbSpaceCommon::bucket_set<B>::remove(const ImgData* nsig) {
+inline void dbSpaceCommon::bucket_set<B>::remove(const ImgData& nsig) {
 	lumin_int avgl;
-	SigStruct::avglf2i(nsig->avglf, avgl);
+	SigStruct::avglf2i(nsig.avglf, avgl);
 	for (int i = 0; 0 && i < NUM_COEFS; i++) {
-		FLIP(nsig->sig1[i]); FLIP(nsig->sig2[i]); FLIP(nsig->sig3[i]);
-//fprintf(stderr, "\r%d %d %d %d", i, nsig->sig1[i], nsig->sig2[i], nsig->sig3[i]);
-		if (nsig->sig1[i]>0) buckets[0][0][nsig->sig1[i]].remove(nsig->id);
-		if (nsig->sig1[i]<0) buckets[0][1][-nsig->sig1[i]].remove(nsig->id);
+		FLIP(nsig.sig1[i]); FLIP(nsig.sig2[i]); FLIP(nsig.sig3[i]);
+//fprintf(stderr, "\r%d %d %d %d", i, nsig.sig1[i], nsig.sig2[i], nsig.sig3[i]);
+		if (nsig.sig1[i]>0) buckets[0][0][nsig.sig1[i]].remove(nsig.id);
+		if (nsig.sig1[i]<0) buckets[0][1][-nsig.sig1[i]].remove(nsig.id);
 
 		if (is_grayscale(avgl))
 			continue;	// ignore I/Q coeff's if chrominance too low
 
-		if (nsig->sig2[i]>0) buckets[1][0][nsig->sig2[i]].remove(nsig->id);
-		if (nsig->sig2[i]<0) buckets[1][1][-nsig->sig2[i]].remove(nsig->id);
+		if (nsig.sig2[i]>0) buckets[1][0][nsig.sig2[i]].remove(nsig.id);
+		if (nsig.sig2[i]<0) buckets[1][1][-nsig.sig2[i]].remove(nsig.id);
 
-		if (nsig->sig3[i]>0) buckets[2][0][nsig->sig3[i]].remove(nsig->id);
-		if (nsig->sig3[i]<0) buckets[2][1][-nsig->sig3[i]].remove(nsig->id);
+		if (nsig.sig3[i]>0) buckets[2][0][nsig.sig3[i]].remove(nsig.id);
+		if (nsig.sig3[i]<0) buckets[2][1][-nsig.sig3[i]].remove(nsig.id);
 	}
 }
 
@@ -1509,25 +1418,35 @@ Score dbSpaceImpl<is_simple>::calcDiff(imageId id1, imageId id2, bool ignore_col
 
 template<>
 void dbSpaceImpl<false>::rehash() {
-	for (int c = 0; c < 3; c++)
-		for (int p = 0; p < 2; p++)
-			for (int i = 0; i < 16384; i++) {
-				bucket_type& list = imgbuckets[c][p][i];
-				size_t size = list.size();
-				list.clear();
-				list.resize(size & ~pageImgMask);
-			}
+	for (buckets_t::iterator itr = imgbuckets.begin(); itr != imgbuckets.end(); ++itr) {
+		size_t size = itr->size();
+		itr->clear();
+		itr->resize(size & ~pageImgMask);
+	}
 
 	for (imageIterator itr = image_begin(); itr != image_end(); ++itr) {
 		ImgData dsig;
 		read_sig_cache(itr.cOfs(), &dsig);
-		imgbuckets.add(&dsig, itr.index());
+		imgbuckets.add(dsig, itr.index());
 	}
 
 	m_bucketsValid = true;
 }
 
 template<> void dbSpaceImpl<true>::rehash() { throw usage_error("Invalid for read-only db."); }
+
+void dbSpaceAlter::rehash() {
+	memset(m_buckets.begin(), 0, m_buckets.size());
+
+	for (ImageMap::iterator it = m_images.begin(); it != m_images.end(); ++it)
+		m_buckets.add(get_sig(it->second), it->second);
+}
+
+template<bool is_simple>
+void dbSpaceImpl<is_simple>::getImgQueryArg(imageId id, queryArg* query) {
+	ImgData img = get_sig_from_cache(id);
+	queryFromImgData(img, query);
+}
 
 template<bool is_simple>
 size_t dbSpaceImpl<is_simple>::getImgCount() {
@@ -1541,14 +1460,56 @@ size_t dbSpaceAlter::getImgCount() {
 template<bool is_simple>
 stats_t dbSpaceImpl<is_simple>::getCoeffStats() {
 	stats_t ret;
-	ret.reserve(numbuckets);
+	ret.reserve(imgbuckets.count());
 
-	for (int c = 0; c < 3; c++)
-	  for (int s = 0; s < 2; s++)
-	    for (int i = 0; i < 16384; i++) {
-		uint32_t id = (c << 24) | (s << 16) | i;
-		ret.push_back(std::make_pair(id, imgbuckets[c][s][i].size()));
-	    }
+#ifdef DEBUG_STATS
+	typedef std::tr1::unordered_map<int, size_t> deltas_t;
+	deltas_t deltas;
+	size_t total = 0, b4 = 0, b70 = 0, b16k = 0, a16k = 0, b255 = 0;
+#endif
+
+	for (typename buckets_t::iterator itr = imgbuckets.begin(); itr != imgbuckets.end(); ++itr) {
+		ret.push_back(std::make_pair(itr - imgbuckets.begin(), itr->size()));
+
+#ifdef DEBUG_STATS
+		AutoImageIdIndex_map<is_simple> map(itr->map_all(false));
+		size_t last = 0;
+		for (idIndexIterator itr(map.begin(), *this); itr != map.end(); ++itr) {
+			size_t delta = itr.index() - last;
+			total++;
+			if (delta < 5) b4++;
+			else if (delta < 71) b70++;
+			else if (delta < 16455) b16k++;
+			else a16k++;
+			if (delta < 255) b255++;
+			deltas[delta]++;
+			last = itr.index();
+		}
+#endif
+	}
+
+#ifdef DEBUG_STATS
+	typedef std::pair<size_t, int> delta_t;
+	std::priority_queue<delta_t, std::vector<delta_t>, std::greater<delta_t> > deltas_max;
+	deltas_t::iterator itr = deltas.begin();
+	for (; deltas_max.size() < 128 && itr != deltas.end(); ++itr)
+		deltas_max.push(std::make_pair(itr->second, itr->first));
+	for (; itr != deltas.end(); ++itr) {
+		deltas_max.push(std::make_pair(itr->second, itr->first));
+		deltas_max.pop();
+	}
+	while (!deltas_max.empty()) {
+		deltas.erase(deltas_max.top().second);
+		ret.push_back(std::make_pair(deltas_max.top().second, deltas_max.top().first));
+		deltas_max.pop();
+	}
+	ret.push_back(std::make_pair(~size_t(), total));
+	ret.push_back(std::make_pair(4, b4));
+	ret.push_back(std::make_pair(70, b70));
+	ret.push_back(std::make_pair(16454, b16k));
+	ret.push_back(std::make_pair(~size_t(), a16k));
+	ret.push_back(std::make_pair(255, b255));
+#endif
 
 	return ret;
 }
@@ -1565,6 +1526,7 @@ imageId_list dbSpaceImpl<is_simple>::getImgIdList() {
 
 	ids.reserve(getImgCount());
 	for (imageIterator it = image_begin(); it != image_end(); ++it)
+	    if (!is_simple || it.avgl()[0] != 0)
 		ids.push_back(it.id());
 
 	return ids;
@@ -1835,8 +1797,8 @@ dbSpaceImpl<is_simple>::dbSpaceImpl(bool with_struct) :
 	m_bucketsValid(true) {
 
 	if (!imgBinInited) initImgBin();
-	if (numbuckets != sizeof(imgbuckets) / sizeof(imgbuckets[0][0][0]))
-		throw internal_error("numbuckets is wrong!");
+	if (imgbuckets.count() != sizeof(imgbuckets) / sizeof(imgbuckets[0][0][0]))
+		throw internal_error("bucket_set.count() is wrong!");
 
 	if (with_struct)
 		m_sigFile = tempfile();
@@ -1868,6 +1830,7 @@ dbSpaceAlter::~dbSpaceAlter() {
 		m_f->close();
 		delete m_f;
 		m_f = NULL;
+		m_fname.clear();
 	}
 }
 

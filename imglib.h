@@ -48,8 +48,15 @@ different but the majority of the actual code is the same for both types.
 #include <list>
 #include <tr1/unordered_map>
 
+#include <fstream>
+#include <iostream>
+
+#include <magick/api.h>
+
 #include "auto_clean.h"
+#include "delta_queue.h"
 #include "haar.h"
+#include "imgdb.h"
 
 namespace imgdb {
 
@@ -79,27 +86,64 @@ union image_id_index {
 	imageId id;
 	size_t index;
 	image_id_index(imageId i) : id(i) { }
-	image_id_index(size_t ind, bool) : index(ind) { }
+	explicit image_id_index(size_t ind) : index(ind) { }
 	image_id_index() { }
 	bool operator==(const image_id_index& other) const { return id == other.id; }
 	bool operator!=(const image_id_index& other) const { return id != other.id; }
+
+	operator size_t&() { return index; }
+	operator imageId&() { return id; }
 };
 
+typedef std::vector<image_id_index> IdIndex_list;
+
+template<bool is_simple> struct map_iterator;
+template<> struct map_iterator<false> : public std::iterator<std::forward_iterator_tag, image_id_index> { 
+	map_iterator(image_id_index* p) : m_p(p) { }
+	map_iterator() { }
+
+	image_id_index*	operator->() const { return m_p; }
+	image_id_index&	operator* () const { return *m_p; }
+	map_iterator&	operator++() { ++m_p; return *this; }
+	map_iterator	operator++(int) { return m_p++; }
+	map_iterator&	operator--() { --m_p; return *this; }
+	map_iterator	operator--(int) { return m_p--; }
+	bool		operator!=(const map_iterator& other) { return m_p != other.m_p; }
+
+	image_id_index* m_p;
+};
+#ifdef USE_DELTA_QUEUE
+#ifdef USE_DISK_CACHE
+#error Sorry, delta queue and disk cache cannot be used at the same time.
+#endif
+template<> struct map_iterator<true> : public delta_iterator {
+	typedef delta_iterator base_type;
+
+	map_iterator(const size_t* idx) : base_type((delta_value*)idx) { }
+	map_iterator(const base_type& itr) : base_type(itr) { }
+	map_iterator() { }
+
+	size_t get_index() const { return **this; }
+};
+#else
+template<> struct map_iterator<true> : public map_iterator<false> {
+	typedef map_iterator<false> base_type;
+
+	map_iterator(const size_t* idx) : base_type((image_id_index*)idx) { }
+	map_iterator(const IdIndex_list::iterator& itr) : base_type(&*itr) { }
+	map_iterator() { }
+
+	size_t get_index() const { return (*this)->index; }
+};
+#endif
+
+template<bool is_simple>
 struct imageIdIndex_map {
-	struct iterator : public std::iterator<std::forward_iterator_tag, image_id_index> { 
-		iterator(image_id_index* p) : m_p(p) { }
-		image_id_index*	operator->() const { return m_p; }
-		image_id_index&	operator* () const { return *m_p; }
-		iterator&	operator++() { ++m_p; return *this; }
-		iterator	operator++(int) { return m_p++; }
-		bool		operator!=(const iterator& other) { return m_p != other.m_p; }
-		image_id_index* m_p;
-	};
-	typedef const image_id_index* const_iterator;
-	imageIdIndex_map() : m_base(NULL), m_img(NULL), m_end(NULL) { }
-	imageIdIndex_map(void* base, image_id_index* img, size_t size, size_t l)
-		: m_base(base), m_img(img), m_end(img + size), m_length(l) { }
-	image_id_index& operator[] (size_t ofs) { return m_img[ofs]; }
+	typedef map_iterator<is_simple> iterator;
+	imageIdIndex_map() : m_base(NULL) { }
+	imageIdIndex_map(void* base, iterator img, iterator end, size_t l)
+		: m_base(base), m_img(img), m_end(end), m_length(l) { }
+	//image_id_index& operator[] (size_t ofs) { return m_img[ofs]; }
 	bool operator! () { return m_base; }
 	void unmap();
 	iterator begin() { return m_img; }
@@ -107,18 +151,22 @@ struct imageIdIndex_map {
 	size_t size() { return m_end - m_img; }
 
 	void* m_base;
-	image_id_index* m_img;
-	image_id_index* m_end;
+	iterator m_img;
+	iterator m_end;
 	size_t m_length;
 };
 
 // Automatically unmaps the imageIdIndex_map when it goes out of scope.
-typedef AutoClean<imageIdIndex_map, &imageIdIndex_map::unmap> AutoImageIdIndex_map;
+template<bool is_simple>
+struct AutoImageIdIndex_map : public AutoClean<imageIdIndex_map<is_simple>, &imageIdIndex_map<is_simple>::unmap> {
+	typedef AutoClean<imageIdIndex_map<is_simple>, &imageIdIndex_map<is_simple>::unmap> base_type;
+	AutoImageIdIndex_map(const imageIdIndex_map<is_simple>& map) : base_type(map) { }
+};
 
 // Clean up Image when it goes out of scope.
 struct ImagePtr {
 	ImagePtr(Image* i) : m_image(i) { }
-	void destroy() { DestroyImage(m_image); }
+	void destroy() { if (m_image) DestroyImage(m_image); m_image=NULL; }
 	bool operator! () { return !m_image; }
 	Image* operator& () { return m_image; }
 	Image* m_image;
@@ -143,30 +191,46 @@ typedef std::pair<off_t, size_t> imageIdPage;
 
 template<bool is_simple, bool is_memory> class imageIdIndex_list;
 
-typedef std::vector<image_id_index> IdIndex_list;
-
 template<>
 class imageIdIndex_list<true, true> {
 public:
 	static const size_t threshold = 0;
+#ifdef USE_DELTA_QUEUE
+	class container : public delta_queue {
+	public:
+		struct const_iterator : public delta_iterator {
+			const_iterator(const delta_iterator& itr) : delta_iterator(itr) { }
+			size_t get_index() const { return **this; }
+		};
+	};
+#else
+	class container : public IdIndex_list {
+	public:
+		struct const_iterator : public IdIndex_list::const_iterator {
+			typedef IdIndex_list::const_iterator base_type;
+			const_iterator(const base_type& itr) : base_type(itr) { }
+			size_t get_index() const { return (*this)->index; }
+		};
+	};
+#endif
 
-	imageIdIndex_map map_all(bool writable) { return writable ? imageIdIndex_map(NULL, &m_tail.front(), m_tail.size(), 0) : imageIdIndex_map(NULL, &m_base.front(), m_base.size(), 0); };
+	imageIdIndex_map<true> map_all(bool writable) { return writable ? imageIdIndex_map<true>(NULL, m_tail.begin(), m_tail.end(), 0) : imageIdIndex_map<true>(NULL, m_base.begin(), m_base.end(), 0); };
 	bool empty() { return m_tail.empty() && m_base.empty(); }
 	size_t size() { return m_tail.size() + m_base.size(); }
 	void reserve(size_t num) { if (num > m_base.size()) m_tail.reserve(num - m_base.size()); }
-	void resize(size_t num) { if (num <= size()) return; m_tail.resize(num - m_base.size()); }
-	void loaded(size_t num) { if (num > m_tail.size()) throw data_error("Loaded too many."); m_tail.resize(num); }
-	void set_base() { if (m_base.empty()) m_base.swap(m_tail); }
-	void push_back(image_id_index i) { m_tail.push_back(i); }
+	//void resize(size_t num) { if (num <= size()) return; m_tail.resize(num - m_base.size()); }
+	void loaded(size_t num) { if (num != m_tail.size()) throw data_error("Loaded incorrect number."); }
+	void set_base();
+	void push_back(image_id_index i) { m_tail.push_back(i.index); }
 	void remove(image_id_index i); // unimplemented.
 
-	const IdIndex_list& tail() { return m_tail; }
+	const container& tail() { return m_tail; }
 
 	static int fd() { return -1; }
 
 protected:
-	IdIndex_list m_tail;
-	IdIndex_list m_base;
+	container m_tail;
+	container m_base;
 };
 
 template<>
@@ -175,9 +239,18 @@ class imageIdIndex_list<is_simple, false> {
 public:
 	static const size_t threshold = 128;
 
+	class container : public IdIndex_list {
+	public:
+		struct const_iterator : public IdIndex_list::const_iterator {
+			typedef IdIndex_list::const_iterator base_type;
+			const_iterator(const base_type& itr) : base_type(itr) { }
+			size_t get_index() const { return (*this)->index; }
+		};
+	};
+
 	imageIdIndex_list() : m_size(0), m_capacity(0) { }
 
-	imageIdIndex_map map_all(bool writable);
+	imageIdIndex_map<is_simple> map_all(bool writable);
 	bool empty() { return !m_size && m_tail.empty(); }
 	size_t size() { return m_size + m_tail.size(); }
 	void reserve(size_t num) { resize(num); }
@@ -188,7 +261,7 @@ public:
 	void remove(image_id_index i);
 	void clear() { m_tail.clear(); m_size = 0; }
 
-	const IdIndex_list& tail() { return m_tail; }
+	const container& tail() { return m_tail; }
 
 	static int fd() { return m_fd; }
 
@@ -204,7 +277,7 @@ protected:
 	size_t m_size;
 	size_t m_capacity;
 	size_t m_baseofs;
-	IdIndex_list m_tail;
+	container m_tail;
 };
 
 class bloom_filter;
@@ -226,11 +299,6 @@ public:
 	{
 		//delete keywords;
 	}
-
-	static void avglf2i(const double avglf[3], lumin_int avgl) {
-		for (int c = 0; c < 3; c++)
-			avgl[c] = lrint(ScoreMax * avglf[c]);
-	};
 
 	void init(const ImgData* nsig) {
 		id = nsig->id;
@@ -293,7 +361,8 @@ struct index_iterator<false> : public sigMap<false>::iterator {
 	const lumin_int& avgl() const { return sig()->avgl; }
 	int width() const { return sig()->width; }
 	int height() const { return sig()->height; }
-	uint32_t set() const { return sig()->set; }
+	uint16_t set() const { return sig()->set; }
+	uint16_t mask() const { return sig()->mask; }
 	size_t cOfs() const { return sig()->cacheOfs; }
 	Score asp() const { return get_aspect(sig()->width, sig()->height); }
 };
@@ -313,7 +382,8 @@ struct index_iterator<true> : public image_info_list::iterator {
 	const lumin_int& avgl() const { return (*this)->avgl; }
 	int width() const { return (*this)->width; }
 	int height() const { return (*this)->height; }
-	uint32_t set() const { return (*this)->set; }
+	uint16_t set() const { return (*this)->set; }
+	uint16_t mask() const { return (*this)->mask; }
 	size_t cOfs() const { return index() * sizeof(ImgData); }
 	Score asp() const { return 0; }
 
@@ -341,7 +411,7 @@ template<typename B>
 struct id_index_iterator<true,B> : public B {
 	typedef B base_type;
 	id_index_iterator(const base_type& itr, dbSpaceImpl<true>& db) : base_type(itr) { }
-	size_t index() const { return (*this)->index; };
+	size_t index() const { return this->get_index(); };
 };
 
 // Simplify reading/writing stream data.
@@ -402,17 +472,35 @@ protected:
 	template<typename B>
 	class bucket_set {
 	public:
-		typedef B colbucket[2][16384];
-		colbucket buckets[3];
+		static const size_t count_0 = 3;	// Colors
+		static const size_t count_1 = 2;	// Coefficient signs.
+		static const size_t count_2 = 16384;	// Coefficient magnitudes.
+
+		// Do some sanity checking to ensure the array is layed out how we think it is layed out.
+		// (Otherwise the iterators will be broken.)
+		bucket_set() {
+			if ((size_t)(end() - begin()) != count() || (size_t)((char*)end() - (char*)begin()) != size() || size() != sizeof(*this))
+				throw internal_error("bucket_set array packed badly.");
+		}
+
+		typedef B* iterator;
+		typedef B colbucket[count_1][count_2];
 
 		colbucket& operator[] (size_t ind) { return buckets[ind]; }
-
 		B& at(int col, int coef, int* idxret = NULL);
-		void add(const ImgData* img, size_t index);
-		void remove(const ImgData* img);
-	};
 
-	static const size_t numbuckets = 3 * 2 * 16384;
+		void add(const ImgData& img, size_t index);
+		void remove(const ImgData& img);
+
+		iterator begin() { return buckets[0][0]; }
+		iterator end() { return buckets[count_0][0]; }
+
+		static size_t count() { return count_0 * count_1 * count_2; }
+		static size_t size() { return count() * sizeof(B); }
+
+	private:
+		colbucket buckets[count_0];
+	};
 
 private:
 	void operator = (const dbSpaceCommon&);
@@ -428,13 +516,9 @@ public:
 	virtual void save_file(const char* filename);
 
 	// Image queries.
-	virtual sim_vector queryImgID(imageId id, unsigned int numres, int flags);
-	virtual sim_vector queryImgIDFast(imageId id, unsigned int numres, int flags);
-	virtual sim_vector queryImgIDFiltered(imageId id, unsigned int numres, int flags, bloom_filter* bf);
-	virtual sim_vector queryImgRandom(unsigned int numres, int flags);
-	virtual sim_vector queryImgData(const ImgData& img, unsigned int numres, int flags);
-	virtual sim_vector queryImgDataFast(const ImgData& img, unsigned int numres, int flags);
-	virtual sim_vector queryImgFile(const char* filename, unsigned int numres, int flags);
+	virtual sim_vector queryImg(const queryArg& query);
+
+	virtual void getImgQueryArg(imageId id, queryArg* query);
 
 	// Stats.
 	virtual size_t getImgCount();
@@ -460,22 +544,30 @@ public:
 	virtual const lumin_int& getImageAvgl(imageId id);
 
 protected:
+#ifdef USE_DISK_CACHE
+	static const bool is_memory = false;
+#else
+	static const bool is_memory = is_simple;
+#endif
+
 	typedef index_iterator<is_simple> imageIterator;
 	typedef sigMap<is_simple> image_map;
 	typedef typename image_map::iterator map_iterator;
 
-	typedef id_index_iterator<is_simple, imageIdIndex_map::iterator> idIndexIterator;
-	typedef id_index_iterator<is_simple, IdIndex_list::const_iterator> idIndexTailIterator;
+	typedef id_index_iterator<is_simple, typename imageIdIndex_map<is_simple>::iterator> idIndexIterator;
+	typedef id_index_iterator<is_simple, typename imageIdIndex_list<is_simple, is_memory>::container::const_iterator> idIndexTailIterator;
 
 	friend struct index_iterator<is_simple>;
-	friend struct id_index_iterator<is_simple, imageIdIndex_map::iterator>;
-	friend struct id_index_iterator<is_simple, IdIndex_list::const_iterator>;
+	friend struct id_index_iterator<is_simple, typename imageIdIndex_map<is_simple>::iterator>;
+	friend struct id_index_iterator<is_simple, typename imageIdIndex_list<is_simple, is_memory>::container::const_iterator>;
 
 	image_info_list& info() { return m_info; }
 	imageIterator find(imageId i);
 
 	virtual void load(const char* filename);
 	virtual void load_stream_old(db_ifstream& f, uint version);
+
+	bool skip_image(const imageIterator& itr, const queryArg& query);
 
 private:
 	imageIterator image_begin();
@@ -489,11 +581,7 @@ private:
 	void read_sig_cache(size_t ofs, ImgData* sig);
 
 	template<int num_colors>
-	sim_vector do_query(const Idx* sig1, const Idx* sig2, const Idx* sig3, const lumin_int& avgl, unsigned int numres, int flags, bloom_filter* bfilter, bool fast);
-
-	sim_vector queryImgDataFiltered(const Idx* sig1, const Idx* sig2, const Idx* sig3, const lumin_int& avgl, unsigned int numres, int flags, bloom_filter* bfilter, bool fast);
-	sim_vector queryImgDataFiltered(const ImgData& img, unsigned int numres, int flags, bloom_filter* bfilter, bool fast);
-	sim_vector queryImgData(const Idx* sig1, const Idx* sig2, const Idx* sig3, const lumin_int& avgl, unsigned int numres, int flags);
+	sim_vector do_query(const queryArg q);
 
 	int m_sigFile;
 	size_t m_cacheOfs;
@@ -508,18 +596,13 @@ protected:
 	   R=0/G=1/B=2, pos=0/neg=1, (i*NUM_PIXELS+j)
 	 */
 
-#ifdef USE_DISK_CACHE
-	static const bool is_memory = false;
-#else
-	static const bool is_memory = is_simple;
-#endif
-
 	struct bucket_type : public imageIdIndex_list<is_simple, is_memory> {
 		typedef imageIdIndex_list<is_simple, is_memory> base_type;
-		void add(image_id_index id, size_t index) { base_type::push_back(is_simple ? image_id_index(index, true) : image_id_index(id)); }
+		void add(image_id_index id, size_t index) { base_type::push_back(is_simple ? image_id_index(index) : image_id_index(id)); }
 		void remove(image_id_index id) { base_type::remove(id); }
 	};
-	bucket_set<bucket_type> imgbuckets;
+	typedef bucket_set<bucket_type> buckets_t;
+	buckets_t imgbuckets;
 	bool m_bucketsValid;
 };
 
@@ -529,17 +612,11 @@ public:
 	dbSpaceAlter();
 	virtual ~dbSpaceAlter();
 
-	// Warning: filename is disregarded, it ALWAYS saves to the currently open file ONLY.
 	virtual void save_file(const char* filename);
 
 	// Image queries not supported.
-	virtual sim_vector queryImgID(imageId id, unsigned int numres, int flags) { throw usage_error("Not supported in alter mode."); }
-	virtual sim_vector queryImgIDFast(imageId id, unsigned int numres, int flags) { throw usage_error("Not supported in alter mode."); }
-	virtual sim_vector queryImgIDFiltered(imageId id, unsigned int numres, int flags, bloom_filter* bf) { throw usage_error("Not supported in alter mode."); }
-	virtual sim_vector queryImgRandom(unsigned int numres, int flags) { throw usage_error("Not supported in alter mode."); }
-	virtual sim_vector queryImgData(const ImgData& img, unsigned int numres, int flags) { throw usage_error("Not supported in alter mode."); }
-	virtual sim_vector queryImgDataFast(const ImgData& img, unsigned int numres, int flags) { throw usage_error("Not supported in alter mode."); }
-	virtual sim_vector queryImgFile(const char* filename, unsigned int numres, int flags) { throw usage_error("Not supported in alter mode."); }
+	virtual sim_vector queryImg(const queryArg& query) { throw usage_error("Not supported in alter mode."); }
+	virtual void getImgQueryArg(imageId id, queryArg* query) { throw usage_error("Not supported in alter mode."); }
 
 	// Stats. Partially unsupported (* could easily be supported by reading from disk but isn't needed).
 	virtual size_t getImgCount();
@@ -556,7 +633,7 @@ public:
 	virtual void setImageRes(imageId id, int width, int height);
 
 	virtual void removeImage(imageId id);
-	virtual void rehash() { }
+	virtual void rehash();
 
 	// Similarity.
 	virtual Score calcAvglDiff(imageId id1, imageId id2) { throw usage_error("Not supported in alter mode."); } // *
@@ -589,8 +666,10 @@ private:
 
 	ImageMap m_images;
 	db_fstream* m_f;
+	std::string m_fname;
 	off_t m_hdrOff, m_sigOff, m_imgOff;
-	bucket_set<bucket_type> m_buckets;
+	typedef bucket_set<bucket_type> buckets_t;
+	buckets_t m_buckets;
 	DeletedList m_deleted;
 	bool m_rewriteIDs;
 };
@@ -647,10 +726,10 @@ bloom_filter* getIdsBloomFilter(const int dbId);
 // keywordStruct* getKwdPostings(int hash);
 
 // Delayed implementations.
-index_iterator<true>::index_iterator(const sigMap<true>::iterator& itr, dbSpaceImpl<true>& db)
+inline index_iterator<true>::index_iterator(const sigMap<true>::iterator& itr, dbSpaceImpl<true>& db)
   : base_type(db.info().begin() + itr->second), m_db(db) { }
-size_t index_iterator<true>::index() const { return *this - m_db.info().begin(); }
-template<typename B> size_t id_index_iterator<false, B>::index() const { return m_db.find((*this)->id).index(); }
+inline size_t index_iterator<true>::index() const { return *this - m_db.info().begin(); }
+template<typename B> inline size_t id_index_iterator<false, B>::index() const { return m_db.find((*this)->id).index(); }
 
 } // namespace
 

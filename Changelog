@@ -1,3 +1,18 @@
+iqdb-20080611:
+- greatly reduced memory usage (and only slightly increased query
+  times) with USE_DELTA_QUEUE in the Makefile (enabled by default)
+- support for returning only results matching an AND/XOR bit mask
+  set the mask with the command "query_opt mask <and> <xor>"
+  (mask stored internally instead of the image width)
+- the rehash command in "alter" mode (e.g. when run as
+  "iqdb command ...") will update bucket sizes if they are out of
+  sync, to reduce memory usage
+- added PHP CurlTransfer class which implements the HTTP transfer
+  with regular status updates on slow or stalled transfers
+- fixed a bug that caused it to ignore width and height set
+  while adding an image, as opposed to with "set_res" later
+- several internal code cleanups and optimizations
+
 iqdb-20080417:
 - load data needed for queries into memory in readonly/simple mode
   (can be disabled by editing the Makefile configuration)

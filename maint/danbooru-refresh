@@ -14,35 +14,45 @@ if ! lockfile -r 0 update.lock; then
 fi
 trap "rm -f update.lock" SIGHUP SIGINT SIGQUIT SIGTERM EXIT
 
-if [ "$1" = "update" ]; then
-	echo Update
+export http_proxy=http://localhost:3128/
 
-	export http_proxy=http://localhost:3128/
-	nice ./danbooru-update danbooru   || let EC=$EC+2
-	nice ./danbooru-update konachan   || let EC=$EC+2
-	nice ./danbooru-update moe.imouto || let EC=$EC+2
-	nice ./danbooru-quickupd danbooru   || let EC=$EC+16;
-	nice ./danbooru-quickupd konachan   || let EC=$EC+16;
-	nice ./danbooru-quickupd moe.imouto || let EC=$EC+16;
+MODE="$1"
+if [ "$MODE" = "auto" ]; then
+	MODE=`perl -le 'print 2<24*-M $ARGV[0]?"full":"update"' ~/doujin/.lastupdate`
+fi;
+if [ "$MODE" = "update" ]; then
+	echo Quick update
 
-	touch ~/doujin/danbooru/.lastquickupdate
+	./danbooru-change danbooru   || let EC=$EC+2
+	./danbooru-change konachan   || let EC=$EC+2
+	./danbooru-change moe.imouto || let EC=$EC+2
+
+	touch ~/doujin/.lastquickupdate
 	exit $EC
+elif [ "$MODE" = "full" ]; then
+	echo Full update
+
+	./danbooru-change danbooru   full  || let EC=$EC+2
+	./danbooru-change konachan   full  || let EC=$EC+2
+	./danbooru-change moe.imouto full  || let EC=$EC+2
+
+	touch ~/doujin/.lastupdate
+	exit $EC
+elif [ "$MODE" != "restart" ]; then
+	echo Unknown mode, run as $0 auto/update/full/restart
+	exit 1;
 fi;
 
-nice ./danbooru-db danbooru   || let EC=$EC+16;
-nice ./danbooru-db konachan   || let EC=$EC+16;
-nice ./danbooru-db moe.imouto || let EC=$EC+16;
-
-SCREEN=imgSeekOne
-OTHER=imgSeekTwo
-screen -ls|grep imgSeek
+SCREEN=iqdbOne
+OTHER=iqdbTwo
+screen -ls|grep iqdb
 if screen -ls|grep $SCREEN &> /dev/null; then
-	SCREEN=imgSeekTwo
-	OTHER=imgSeekOne
+	SCREEN=iqdbTwo
+	OTHER=iqdbOne
 fi;
 PID=`screen -ls|grep $OTHER|perl -lne 'print $1 if /(\d+)/'`
 echo "Starting screen $SCREEN (other $OTHER pid $PID)"
-screen -dmS $SCREEN ~/bin/imgSeek.server listen 5566 -r ~/stuff/haruhi.idb ~/stuff/danbooru.idb ~/stuff/konachan.idb ~/stuff/moe.imouto.idb
+screen -dmS $SCREEN ~/bin/iqdb.server listen 5566 -r ~/stuff/haruhi.idb ~/stuff/danbooru.idb ~/stuff/konachan.idb ~/stuff/moe.imouto.idb
 echo Waiting for $PID to exit.
 COUNT=0
 while [ -n "$PID" -a -d /proc/$PID ]; do
@@ -57,5 +67,5 @@ while ! echo  -e "ping me\ndone now\n"|nc localhost 5566; do
 	if [ $COUNT -gt 3 ]; then echo "Waited too long, aborting."; exit 1; fi;
 	sleep 5;
 done;
-touch ~/doujin/danbooru/.lastupdate
+touch ~/doujin/.lastrestart
 exit $EC

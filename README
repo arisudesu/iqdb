@@ -49,8 +49,10 @@ the first argument being dbid=0. Commands of particular interest are:
 	remove <dbid> <imgid>
 		Remove the given image from the DB.
 	rehash <dbid>
-		Do not use this command, it is no longer useful.
-		(As a special exception, `iqdb rehash foo.db' can
+		This commands updates the coefficient bucket sizes.
+		It is normally not needed, and is inefficient because
+		it needs to read in the entire database.
+		(As a special feature, `iqdb rehash foo.db' can
 		be used to upgrade an old version of the DB.)
 	done now
 		Quit and save all databases to their original file.
@@ -74,8 +76,9 @@ $ iqdb listen [IP:]port [-r] foo.db bar.db baz.db
 Listens on the given IP:port (default localhost if no IP given) for commands,
 after loading the given databases. If -r is specified and the port is
 currently in use by another instance of iqdb, it will load the database and
-then terminate that instance, to reduce the downtime due to loading the
-databases.
+then terminate that instance, to reduce the downtime while loading the
+databases (and to leave the old server running in the rare case that it
+should crash while starting up).
 
 Of particular interest are the following commands:
 
@@ -105,6 +108,9 @@ but require that you also update the DB file directly.
 
 The server has the following possible responses:
 
+	000 iqdb ready
+		Display whenever iqdb is ready to
+		accept a command.
 	100 <text>
 		General informational message.
 	101 <key>=<value>

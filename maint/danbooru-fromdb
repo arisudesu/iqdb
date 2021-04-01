@@ -1,0 +1,270 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+use DBI;
+use URI::Escape;
+use File::Find;
+
+#system("renice 15 $$");
+my $tag = shift or die "Give server tag on command line.\n";
+my $no_online = shift, 1 if @ARGV and $ARGV[0] eq '-r';
+my $mode = "update";
+$mode = shift if @ARGV and ($ARGV[0] eq 'full' or $ARGV[0] eq 'deleted');
+my $max = 0+(shift||0);
+my $cnt = 0;
+
+our ($user,$pw,$host,$table,$dbid,$db_file);
+do "/usr/src/packages/sim/$tag.cfg" and $user and $pw and $host and $table and $dbid and $db_file or die "Can't get DB settings: $!\n";
+$db_file="/opt/stuff/$db_file";
+die "$db_file does not exist\n" unless -e $db_file;
+chdir "$ENV{HOME}/doujin/$tag" or die "Can't chdir: $!\n";
+
+my $pwfile = "$ENV{HOME}/.dou-pw-admin";
+open my $f, "<", $pwfile or die "Can't read $pwfile: $!\n";
+my $password = <$f>;
+chomp $password;
+die "No password in $pwfile\n" unless $password;
+
+print "Finding images... ";
+my %md5;
+find({ wanted => sub { return unless -f and m#^([0-9a-f]{32})\.#; $md5{$1} = 1; } }, "0".."9", "a".."f");
+print scalar keys %md5, " found.\n";
+
+my %ids_db;
+my %ids_online;
+get_ids();
+
+my $dbh = DBI->connect("DBI:mysql:database=sim:host=localhost", "simadmin", $password)
+	or die "Can't connect to database: $DBI::errstr\n";
+
+my $ua = MyUserAgent->new;
+$ua->timeout(10);
+$ua->env_proxy;
+$ua->default_header("Accept-Encoding" => "gzip, deflate");
+$ua->agent("iqdb/0.1 (+http://iqdb.yi.org/)");
+
+my @remove;
+my @add;
+
+my %deleted;
+
+my $warn = 0;
+my $err = 0;
+
+my $sth = $dbh->prepare("select * from $table") or exit 1;
+$sth->execute();
+$max = 1;
+while (my $row = $sth->fetchrow_hashref) {
+	my $posts = MyUserAgent::parse($row->{post});
+	last unless @$posts;
+	for (@$posts) {
+		process() or $err++;
+	}
+}
+
+print "Updating DBs...\n";
+update_iqdb();
+
+print "Checking ", scalar keys %md5, " known MD5s...\n";
+for (keys %md5) {
+	next unless $md5{$_};
+	print "No post for $_! " and $warn++;
+	/^(.)(.)(.)/;
+	my $file = "$1/$2/$3/$_.jpg";
+	print "But $file doesn't exist either!!\n" and next unless -f $file;
+	print "Moving to todelete/. ";
+	rename $file, "todelete/$_.jpg" or warn "Can't move: $!\n" and next;
+	print "OK.\n";
+}
+print "Done!\n";
+die "Had errors.\n" if $err;
+die "Had $warn warnings.\n" if $warn;
+
+sub process {
+	$cnt++;
+	die "Invalid row (no ID): $_\n" unless $_->{id};
+
+	my $id = $_->{id};
+	die "Invalid ID $id: $_\n" unless $id eq 0 + $id;
+	$id = 0 + $id;
+
+	my $change = $_->{change};
+	die "Invalid change ID $change: $_\n" unless $change eq 0 + $change;
+
+	die "Invalid row (no URL): $_\n" unless $_->{preview_url};
+	my $url = $_->{preview_url};
+
+	my $md5 = lc $_->{md5};
+	die "Invalid md5: $md5\n" unless length $md5 =~ /^[0-9a-f]{32}$/;
+
+	my ($file,$suf) = ($md5, substr $url, rindex $url, ".");
+	$file =~ /^(.)(.)(.)/;
+	$file = "$1/$2/$3/$file.jpg";
+	print "$id: $url -> $file:" unless $max;
+
+	if ($_->{status} eq 'deleted') {
+		print "DELETED" unless $max;
+		push @remove, sprintf "0x%x", $id if $ids_db{$id} or $ids_online{$id};
+		$deleted{$id} = 1;
+		if (-e $file) {
+			print " moving to deleted/";
+			rename $file, "deleted/$md5.jpg" or die "\nCan't move $file to deleted/: $!\n";
+		}
+		$file = "";
+
+	} elsif ($url =~ m#/(default|download|deleted)\.png$#) {
+		print "SKIPPED" unless $max;
+		$file = "";
+
+	} elsif (-e $file) {
+		print "Exists" unless $max;
+
+	} elsif ($suf ne '.jpg') {
+		print STDERR "$id: $url -> $file: " if $max;
+		die "Suffix not .jpg!\n";
+
+	} else {
+		print "$id: $url -> $file:" if $max;
+		retrieve($url, $md5, $file) or $file = undef;
+	}
+
+	if (not exists $md5{$md5}) {
+		print "No file for $md5!\n" if $file and not -e $file;
+		$md5{$md5} = 0;
+	} elsif ($md5{$md5}) {
+		$md5{$md5} = 0;
+	} else {
+		warn "Duplicate MD5 in posts table: $md5!\n" and $warn++;
+	}
+
+	if ($file) {
+		$_->{width} ||= 0;
+		$_->{height} ||= 0;
+		push @add, [$id, sprintf "0x%x $_->{width} $_->{height}:$ENV{HOME}/doujin/$tag/$file", $id] unless $ids_db{$id} or $ids_online{$id};
+	}
+	print " OK\n" unless $max;
+	return defined $file;
+}
+
+sub retrieve {
+	my ($url, $md5, $file) = @_;
+	my $tmpfile = "new/$md5.jpg";
+
+	my $res = $ua->mirror($url, $tmpfile);
+	if ($res->code == 500) {
+		print "Failed (".$res->status_line.")! Trying again. ";
+		$res = $ua->mirror($url, $tmpfile);
+	}
+	if ($res->code == 403) {
+		print "Skipped (403)\n";
+		print STDERR "$url: ".$res->status_line."\n";
+		$warn++;
+		return 1;
+	}
+	#if ($res->code == 404) {
+	#	print "Skipped (404)\n";
+	#	print STDERR "$url ($id): ".$res->status_line."\n";
+	#	$warn++;
+	#	next;
+	#}
+	if ($res->code >= 500) {
+		print "Failed (".$res->status_line.")! Aborting.\n";
+		die "$url: ".$res->status_line."\n";
+	}
+	if (!is_success $res and $res->code != 304) {
+		print "FAILED\n";
+		print STDERR "$url: ".$res->status_line."\n";
+		return;
+	}
+
+	open my $f, "<", $tmpfile or die "Can't read $tmpfile: $!\n";
+	sysread $f, my $fhdr, 10 or die "Can't read $tmpfile: $!\n";
+	use bytes;
+	my $jpeghdr = "\xFF\xD8\xFF\xE0\x00\x10\x4A\x46\x49\x46";
+	$fhdr eq $jpeghdr or die "No JPEG header:\nGot= $fhdr\nWant=$jpeghdr\n";
+	rename $tmpfile, $file or die "Can't move $tmpfile to $file: $!\n";
+	print -s $file;
+	return 1;
+}
+
+sub get_ids {
+	print "Retrieving DB ids... ";
+	open my $iqdb, "-|", "$ENV{HOME}/bin/iqdb", "list", $db_file or die "Can't run iqdb: $!\n";
+	while (<$iqdb>) {
+		chomp;
+		$ids_db{hex $_} = 1;
+	}
+	print scalar keys %ids_db, " ids.\n";
+	return if $no_online;
+
+	print "Retrieving online ids... ";
+	open my $nc, "-|", "echo -e 'list $dbid\\ndone now\\n'|nc localhost 5566" or die "Can't start nc: $!\n";
+	while (<$nc>) {
+		chomp;
+		/^100 ([0-9a-f]+)$/ or print "Unknown response: $_\n" and next;
+		$ids_online{hex $1} = 1;
+	}
+	print scalar keys %ids_online, " ids.\n";
+}
+
+sub update_iqdb {
+	print "Updating DB: removing ", scalar @remove, " images and adding ", scalar @add, ".\n";
+
+	$SIG{PIPE} = 'IGNORE';
+	$|=1;
+	open my $iqdb, "|-", "$ENV{HOME}/bin/iqdb", "command", $db_file or die "Can't run iqdb: $!\n";
+	select $iqdb; $|=1; select STDOUT;
+
+	my $nc;
+	unless ($no_online) {
+		open $nc, "|-", "nc", "localhost", "5566" or die "Can't start nc: $!\n";
+		select $nc; $|=1; select STDOUT;
+	}
+	while (@add or @remove) {
+			my $cmd;
+			if (@remove) {
+				$cmd = shift @remove;
+				print $nc "remove $dbid $cmd\n" unless $no_online;
+				print $iqdb "remove 0 $cmd\n";
+			} else {
+				$cmd = shift @add;
+				if ($deleted{$cmd->[0]}) {
+					print "NOT ADDING, REMOVED LATER: @$cmd\n";
+					$warn++;
+					next;
+				}
+				$cmd = $cmd->[1];
+				print $nc "add $dbid $cmd\n" unless $no_online;
+				print $iqdb "add 0 $cmd\n";
+			}
+	}
+	unless ($no_online) {
+		print $nc "done now\n";
+		close $nc;
+		print $iqdb "done now\n" and die "Online failed!\n" if $?;
+	}
+	print $iqdb "quit now\n";
+	close $iqdb or die "File failed!\n";
+}
+
+package MyUserAgent;
+use base qw(LWP::UserAgent XML::Simple Compress::Zlib);
+sub prepare_request {
+	my $self = shift;
+	my $req = $self->SUPER::prepare_request(shift);
+	$req->header(Referer => "http://$host/");
+	return $req;
+}
+sub parse {
+	my @lines = (Compress::Zlib::uncompress($_[0]));
+	my @posts;
+	for (@lines) {
+		next if /^\s*$/ or m#^\s*</posts#;
+		my $post = eval { XML::Simple::XMLin($_) };
+		return "$_: $@" if $@;
+		push @posts, $post;
+	}
+	return \@posts;
+}

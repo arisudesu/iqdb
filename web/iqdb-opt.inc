@@ -10,6 +10,13 @@ $base_url = "http://localhost/";	# Base URL corresponding to $base_dir.
 $maxdim = 2500;				# Maximum allowed image dimensions for thumbnailing.
 $thudim = 150;				# Thumbnail dimensions.
 
+# Optional:
+# $largedim = 1000;			# Resolution limit above which thumbnail generation will be serialized.
+# $largehnd = "serialize_resize";	# Function name to do the serialization, should not return until its turn has come.
+					# If it returns an object, that object's destructor will be called when thumbnail
+					# generation has completed, so that it may release the lock/semaphore/etc.
+# function serialize_resize($size_x, $size_y) { ... }
+
 # Array of database infos for the iqdb server.
 # One set of values for each DB.
 $services = array(

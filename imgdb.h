@@ -34,6 +34,27 @@
 
 namespace imgdb {
 
+/*
+DB file layout.
+
+Count	Size		Content
+1	int		DB file version
+1	size_t		Number of images
+1	off_t		Offset to image signatures
+98304	size_t		Bucket sizes
+num_img	imageId		Image IDs
+?	?		<unused space left for future image IDs up to above offset>
+num_img	ImgData		Image signatures
+
+When removing images would leave holes in the image signatures and they were
+not filled by new images, signatures from the end will be relocated to fill
+them. The file is not shrunk in anticipation of more images being added later.
+
+When there is no more space for image IDs in the header, a number of
+signatures are relocated from the front to the end of the file to mask space
+for new image IDs.
+*/
+
 // Global typedefs and consts.
 typedef unsigned long int imageId;
 typedef int32_t Score;
@@ -103,12 +124,19 @@ struct image_info {
 	imageId id;
 	lumin_int avgl;
 	union {
-		struct {
-			uint16_t width;
-			uint16_t height;
-		};
-		uint32_t set;
+		uint16_t width;
+		uint16_t set;
 	};
+	union {
+		uint16_t height;
+		uint16_t mask;
+	};
+
+	static void avglf2i(const double avglf[3], lumin_int avgl) {
+		for (int c = 0; c < 3; c++)
+			avgl[c] = lrint(ScoreMax * avglf[c]);
+	};
+
 };
 
 typedef std::vector<sim_value> sim_vector;
@@ -116,12 +144,13 @@ typedef std::vector<std::pair<uint32_t, size_t> > stats_t;
 typedef std::vector<imageId> imageId_list;
 typedef std::vector<image_info> image_info_list;
 typedef signed int lumin_int[3];
+typedef Idx sig_t[NUM_COEFS];
 
 struct ImgData {
 	imageId id;			/* picture id */
-	Idx sig1[NUM_COEFS];		/* Y positions with largest magnitude */
-	Idx sig2[NUM_COEFS];		/* I positions with largest magnitude */
-	Idx sig3[NUM_COEFS];		/* Q positions with largest magnitude */
+	sig_t sig1;			/* Y positions with largest magnitude */
+	sig_t sig2;			/* I positions with largest magnitude */
+	sig_t sig3;			/* Q positions with largest magnitude */
 	double avglf[3];		/* YIQ for position [0,0] */
 	/* image properties extracted when opened for the first time */
 	int width;			/* in pixels */
@@ -133,6 +162,40 @@ class bloom_filter;
 struct srzMetaDataStruct;
 class db_ifstream;
 class db_ofstream;
+
+// Non-standard query arguments.
+struct queryOpt {
+	queryOpt(int fl = 0) : flags(fl), bfilter(NULL), mask_and(0), mask_xor(0) { }
+	void filter(bloom_filter* bf) { bfilter = bf; }
+	void mask(uint16_t maskAnd, uint16_t maskXor);
+	void reset();
+
+	int		flags;
+
+	bloom_filter*	bfilter;
+	uint16_t	mask_and;
+	uint16_t	mask_xor;
+};
+
+// Standard query arguments.
+struct queryArg : public queryOpt {
+	queryArg(dbSpace* db, imageId id, unsigned int numres, int flags);
+	queryArg(const ImgData& img, unsigned int numres, int flags);
+	queryArg(const char* filename, unsigned int numres, int flags);
+
+	// Chainable modifier functions to set non-standard arguments.
+	queryArg& filter(bloom_filter* bf) { queryOpt::filter(bf); return *this; }
+	queryArg& mask(uint16_t maskAnd, uint16_t maskXor) { queryOpt::mask(maskAnd, maskXor); return *this; }
+
+	// Copy, move and reset non-standard arguments.
+	queryArg& merge(const queryOpt& q);
+	queryArg& coalesce(queryOpt& q) { merge(q); q.reset(); return *this; }
+	queryArg& reset() { queryOpt::reset(); return *this; }
+
+	sig_t		sig[3];
+	lumin_int	avgl;
+	unsigned int	numres;
+};
 
 class dbSpace {
 public:
@@ -147,6 +210,11 @@ public:
 	static const int flag_onlyabove	= 0x04;	// For dupe finding: only check and return images beyond selected.
 	static const int flag_uniqueset	= 0x08;	// Return only best match from each set.
 	static const int flag_nocommon	= 0x10;	// Disregard common coefficients (those which are present in at least 10% of the images).
+	static const int flag_fast	= 0x20;	// Check only DC coefficient (luminance).
+
+	// Used internally.
+	static const int flags_internal	= 0xff000000;
+	static const int flag_mask	= 0x10000000;	// Use AND and XOR masks, and only return image if result is zero.
 
 	static dbSpace*    load_file(const char* filename, int mode);
 	virtual void       save_file(const char* filename) = 0;
@@ -154,15 +222,14 @@ public:
 	virtual ~dbSpace();
 
 	// Image queries.
-	virtual sim_vector queryImgID(imageId id, unsigned int numres, int flags) = 0;
-	virtual sim_vector queryImgIDFast(imageId id, unsigned int numres, int flags) = 0;
-	virtual sim_vector queryImgIDFiltered(imageId id, unsigned int numres, int flags, bloom_filter* bf) = 0;
-	virtual sim_vector queryImgRandom(unsigned int numres, int flags) = 0;
-	virtual sim_vector queryImgData(const ImgData& img, unsigned int numres, int flags) = 0;
-	virtual sim_vector queryImgDataFast(const ImgData& img, unsigned int numres, int flags) = 0;
-	virtual sim_vector queryImgFile(const char* filename, unsigned int numres, int flags) = 0;
+	virtual sim_vector queryImg(const queryArg& query) = 0;
 
+	// Image data.
 	static void imgDataFromFile(const char* filename, ImgData* img);
+
+	// Initialize sig and avgl of the queryArg.
+	virtual void getImgQueryArg(imageId id, queryArg* query) = 0;
+	static void queryFromImgData(const ImgData& img, queryArg* query);
 
 	// Stats.
 	virtual size_t getImgCount() = 0;
@@ -197,6 +264,44 @@ protected:
 private:
 	void operator = (const dbSpace&);
 };
+
+// Inline implementations.
+inline void dbSpace::queryFromImgData(const ImgData& img, queryArg* query) {
+	if (sizeof(query->sig) != ((char*)(img.sig3 + NUM_COEFS) - (char*)img.sig1))
+		throw internal_error("query sigs and ImgData sigs packing differs.");
+
+	memcpy(query->sig, img.sig1, sizeof(query->sig));
+	image_info::avglf2i(img.avglf, query->avgl);
+}
+
+inline void queryOpt::mask(uint16_t maskAnd, uint16_t maskXor) {
+	mask_and = maskAnd;
+	mask_xor = maskXor;
+	flags |= dbSpace::flag_mask;
+}
+inline void queryOpt::reset() {
+	mask_and = mask_xor = 0;
+	bfilter = NULL;
+	flags = flags & ~dbSpace::flags_internal;
+}
+inline queryArg::queryArg(dbSpace* db, imageId id, unsigned int nr, int fl) : queryOpt(fl), numres(nr) {
+	db->getImgQueryArg(id, this);
+}
+inline queryArg::queryArg(const ImgData& img, unsigned int nr, int fl) : queryOpt(fl), numres(nr) {
+	dbSpace::queryFromImgData(img, this);
+}
+inline queryArg::queryArg(const char* filename, unsigned int nr, int fl) : queryOpt(fl), numres(nr) {
+	ImgData img;
+	dbSpace::imgDataFromFile(filename, &img);
+	dbSpace::queryFromImgData(img, this);
+}
+inline queryArg& queryArg::merge(const queryOpt& q) {
+	mask_and = q.mask_and;
+	mask_xor = q.mask_xor;
+	bfilter = q.bfilter;
+	flags = (flags & ~dbSpace::flags_internal) | (q.flags & dbSpace::flags_internal);
+	return *this;
+}
 
 } // namespace
 
