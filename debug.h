@@ -55,7 +55,9 @@ DEF_DEBUG(addresses,	21)
 DEF_DEBUG(resizer,	22)
 DEF_DEBUG(image_info,	23)
 DEF_DEBUG(prescale,	24)
-DEF_DEBUG(imgdb,        25)
+DEF_DEBUG(imgdb,	25)
+DEF_DEBUG(urlparse,	26)
+DEF_DEBUG(queryqueue,	27)
 
 static inline timeval now() { timeval tv; gettimeofday(&tv, NULL); return tv; }
 static inline float elapsed(const timeval& from, const timeval& to = now()) {

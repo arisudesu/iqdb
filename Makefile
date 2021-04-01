@@ -1,6 +1,9 @@
 # Some configuration options
 #----------------------------
 
+# Any extra options you need
+EXTRADEFS=
+
 # Graphics library to use, can be GD or ImageMagick.
 IMG_LIB=GD
 #IMG_LIB=ImageMagick

@@ -42,6 +42,9 @@ extern int debug_level;
 
 inline int get_jpeg_info(const unsigned char* data, size_t length, image_info* info) {
 	while (1) {
+		if (length < 2)
+			return -2;
+
 		if (data[0] != 0xff || data[1] < 0xc0) {
 			DEBUG_CONT(image_info)(DEBUG_OUT, "nope, marker is %02x%02x.\n", data[0], data[1]);
 			return 0;
@@ -79,7 +82,7 @@ inline int get_jpeg_info(const unsigned char* data, size_t length, image_info* i
 		}
 
 		// Otherwise skip block.
-		size_t blen = ntohs(*(uint16_t*)((data+2)));
+		size_t blen = length < 2 ? 2 : ntohs(*(uint16_t*)((data+2)));
 		if (length < blen + 4) {
 			DEBUG_CONT(image_info)(DEBUG_OUT, "too short to tell.\n");
 			return blen + 4 - length;
@@ -358,10 +361,10 @@ struct png_error_handler {
 };
 
 void png_error_handler::error(png_structp png, const char *error) {
-	png_error_handler* handler = (png_error_handler*) png->error_ptr;
+	png_error_handler* handler = (png_error_handler*)png_get_error_ptr(png);
 	handler->msg = error;
 	//fprintf(stderr, "PNG error @%p: %s\n", handler, handler->msg);
-	longjmp(png->jmpbuf, 1);
+	longjmp(png_jmpbuf(png), 1);
 }
 void png_error_handler::warning(png_structp png, const char *warning) {
 	DEBUG(warnings)("PNG warning: %s\n", warning);
@@ -464,7 +467,7 @@ inline unsigned int alpha_blend(unsigned int pixel, unsigned int bg, unsigned ch
 */
 
 void AutoPNG::scale(AutoGDImage& img, unsigned int scale_bits) {
-	DEBUG(resizer)("Scaling non-interlaced PNG from %ldx%ld to %dx%d.\n", width, height, img->sx, img->sy);
+	DEBUG(resizer)("Scaling non-interlaced PNG from %ldx%ld to %dx%d.\n", (long)width, (long)height, img->sx, img->sy);
 
 	//AutoCleanArray<png_byte> row(new png_byte[(4 * width) >> scale_bits]);
 	AutoCleanArray<png_byte> row(new png_byte[row_bytes()]);
@@ -518,6 +521,11 @@ void AutoPNG::trunc(AutoGDImage& img, unsigned int scale_bits) {
 
 	//int channels = png_get_channels(png, info);
 	//fprintf(stderr, "Image has %d channels now. %ld bytes per row. Doing %lx transformations.\n", channels, row_bytes(), png->transformations);
+
+	const int png_pass_start[] = {0, 4, 0, 2, 0, 1, 0};
+	const int png_pass_inc[] = {8, 8, 4, 4, 2, 2, 1};
+	const int png_pass_ystart[] = {0, 0, 4, 0, 2, 0, 1};
+	const int png_pass_yinc[] = {8, 8, 8, 4, 4, 2, 2};
 
 	for (int pass = 0; pass < need_passes; pass++) {
 		size_t row_x = png_pass_start[pass] >> scale_bits;

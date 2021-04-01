@@ -90,6 +90,8 @@ function request_match($file, $querysrv, $options = array()) {
 	$queryopt = "";
 	if ($options["mask_and"])
 		$queryopt=sprintf("query_opt mask %d %d\n", $options["mask_and"], $options["mask_xor"]);
+	if (!is_array($querysrv) && array_key_exists("query_db", $services[$services[$querysrv]]))
+		$querysrv = $services[$services[$querysrv]]["query_db"];
 	if (is_array($querysrv)) {
 		$res = "";
 		$query = "";

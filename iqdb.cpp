@@ -344,7 +344,7 @@ fprintf(stderr, "Min score: %.1f\n", ScD(m));
 				//fprintf(stderr, "%.1f", ScD(score));
 				one->score += score;
 				two->score += score;
-		}
+			}
 		std::make_heap(out.begin(), out.end());
 		imgdb::imageId ref = out.front().id;
 		std::pop_heap(out.begin(), out.end());
@@ -356,8 +356,8 @@ fprintf(stderr, "Min score: %.1f\n", ScD(m));
 			one->score = score;
 		}
 		std::make_heap(out.begin(), out.end());
-		lists_list::iterator itr = lists.insert(std::make_pair(db->calcSim(out.front().id, ref, false), std::make_pair(ref, out_list())));
-		itr->second.second.swap(out);
+		lists_list::iterator itr2 = lists.insert(std::make_pair(db->calcSim(out.front().id, ref, false), std::make_pair(ref, out_list())));
+		itr2->second.second.swap(out);
 		//fprintf(stderr, "Group %p has max similarity %.2f\n", &itr->second.second, itr->first);
 	}
 
@@ -634,6 +634,21 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoMap& dbs, bool allow_maint) {
 			fprintf(wr, "101 matches=%zd\n", sim.size());
 			for (size_t i = 0; i < sim.size(); i++)
 				fprintf(wr, "201 %d %08"FMT_imageId" %lf %d %d\n", sim[i].db, sim[i].id, (double)((slope * sim[i].score >> imgdb::ScoreScale) + merge_min) / imgdb::ScoreMax, sim[i].width, sim[i].height);
+
+			queryOpt.reset();
+
+		} else if (!strcmp(command, "sim")) {
+			int dbid, flags, numres;
+			imgdb::imageId id;
+			if (sscanf(arg, "%i %i %i %"FMT_imageId"\n", &dbid, &flags, &numres, &id) != 4)
+				throw imgdb::param_error("Format: sim <dbid> <flags> <numres> <imageId>");
+
+			imgdb::sim_vector sim = DB->queryImg(imgdb::queryArg(DB, id, numres, flags).coalesce(queryOpt));
+			if (queryOpt.mindev > 0)
+				stddev_limit(sim, queryOpt.mindev);
+			fprintf(wr, "101 matches=%zd\n", sim.size());
+			for (size_t i = 0; i < sim.size(); i++)
+				fprintf(wr, "200 %08"FMT_imageId" %lf %d %d\n", sim[i].id, (double)sim[i].score / imgdb::ScoreMax, sim[i].width, sim[i].height);
 
 			queryOpt.reset();
 
@@ -966,10 +981,12 @@ void server(const char* hostport, int numfiles, char** files, bool listen2) {
 		// Unhandled imgdb::base_error means it was fatal or completely unknown.
 		} catch (const imgdb::base_error& err) {
 			fprintf(stream.wr, "302 %s %s\n", err.type(), err.what());
+			fprintf(stderr, "Caught base_error %s: %s\n", err.type(), err.what());
 			throw;
 
-		} catch (...) {
+		} catch (const std::exception& err) {
 			fprintf(stream.wr, "300 Caught unhandled exception!\n");
+			fprintf(stderr, "Caught unhandled exception: %s\n", err.what());
 			throw;
 		}
 

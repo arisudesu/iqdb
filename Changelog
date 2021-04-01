@@ -1,3 +1,11 @@
+iqdb-20130824:
+- fix include files for newer gcc
+- updated scripts
+
+iqdb-20091112:
+- add "sim" command to server mode
+- various improvements in danbooru-change script
+
 iqdb-20090612:
 - add imgseek mode to dupe finder script that searches for a
   given image file in the dupe database

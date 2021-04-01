@@ -65,7 +65,7 @@ The maintenance commands (see listen mode below) are also supported in
 command mode, but perhaps not very useful here.
 
 Changes are automatically saved in the original file upon EOF on stdin,
-or when sending the "done now" or "quit now" commands.
+or when sending the "done" or "quit" commands.
 
 DO NOT interrupt the program with Ctrl-C or similar until the database
 is closed or it may become corrupted.
@@ -98,6 +98,8 @@ Same as above, but listens on the given port and one port below it (i.e.
 if port 5588 is specified, also listens on 5587). The lower port is higher
 priority and all pending requests are serviced before the other port.
 
+To end a request, send the "done" command.
+
 Of particular interest are the following commands:
 
 	query <dbid> <flags> <numres> <filename>
@@ -129,6 +131,12 @@ Of particular interest are the following commands:
 		in different databases (the noise level depends on the number
 		of images in the DB and how self-similar they are).
 
+	sim <dbid> <flags> <numres> <id>
+		Like the "query" function, but queries for images similar to
+		the image with the given ID. This only works if the database
+		has been loaded in "readonly" mode, e.g. using the "load"
+		command described below.
+
 	query_opt <option> <arguments...>
 		Set advanced options for the next query. Options are reset after
 		the next query or multi_query command. Available options are:
@@ -157,7 +165,7 @@ the lower (high-priority) port.
 		be in use yet). The mode can be one of the following:
 			simple	default listen mode, supports fast queries
 				as well as adding/removing images
-			read_only requires more memory but supports image
+			readonly requires more memory but supports image
 				ID queries (needed for duplicate finding)
 			alter	default command mode, supports fast updates
 				of DB files but no queries

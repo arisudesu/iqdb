@@ -7,14 +7,19 @@
 
 #include "imgdb.h"
 #include "resizer.h"
+#include "debug.h"
 
-int debug_level = -1;
+int debug_level = DEBUG_errors | DEBUG_base | DEBUG_summary;
 
 int main(int argc, char** argv) {
-	if (argc < 3) exit(1);
+	if (argc < 3) return 1;
 	const char* thumb = argv[1];
 	const char* outname = argv[2];
-	int thudim = strtol(argv[3], NULL, 0);
+	int thudim = argc < 4 ? 0 : strtol(argv[3], NULL, 0);
+	if (thudim < 8) thudim = 150;
+	int qual = argc < 5 ? 0 : strtol(argv[4], NULL, 0);
+	if (qual < 10) qual = 80;
+	//fprintf(stderr, "%s -> %s %d %d\n", thumb, outname, thudim, qual);
 
 	int fd = -1;
 	unsigned char* map = NULL;
@@ -26,19 +31,23 @@ int main(int argc, char** argv) {
 				(map = (unsigned char*)mmap(NULL, len = st.st_size, PROT_READ, MAP_SHARED, fd, 0)) == MAP_FAILED)
 			throw imgdb::io_errno(errno);
 
-		fprintf(stderr, "Mapped %s at %p:%zd.\n", thumb, map, len);
+		if (map[0] == 'B' && map[1] == 'M') {
+			fprintf(stderr, "Bitmap file, ignoring.\n");
+			exit(64);
+		}
+
 		AutoGDImage thu(resize_image_data(map, len, thudim, 0, 12*thudim));
 
 		FILE *out = fopen(outname, "wb");
 		if (!out) throw imgdb::io_errno(errno);
 
-		gdImageJpeg(thu, out, 95);
+		gdImageJpeg(thu, out, qual);
 		fclose(out);
 
-		fprintf(stderr, "OK:%d %d\n", thu->sx, thu->sy);
 
 	} catch (std::exception& e) {
 		fprintf(stderr, "Resizer caught exception, what=%s.\n", e.what());
+		return 1;
 	}
 
 	if (map) munmap(map, len);

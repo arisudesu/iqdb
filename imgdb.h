@@ -24,6 +24,7 @@
 #ifndef IMGDBASE_H
 #define IMGDBASE_H
 
+#include <stdint.h>
 #include <string.h>
 #include <math.h>
 

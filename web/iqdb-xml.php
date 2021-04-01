@@ -18,7 +18,7 @@ header("Content-type: application/xml; charset=utf-8");
 echo "<?xml version='1.0' encoding='UTF-8'?>\n";
 
 function error($text) {
-	echo '<error message="'.htmlentities($text).'" info=""></error>';
+	echo '<error message="'.htmlentities($text, ENT_QUOTES).'" info=""></error>';
 	exit;
 }
 # for debugging problems
