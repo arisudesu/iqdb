@@ -902,9 +902,10 @@ fprintf(stderr, "Saving metadata.\n");
 
 template<bool is_simple>
 int dbSpaceImpl<is_simple>::save_file(const char *filename) {
-	std::ofstream f(filename, std::ios::binary);
+	std::string temp = std::string(filename) + ".temp";
+	std::ofstream f(temp.c_str(), std::ios::binary);
 	if (!f.is_open()) {
-		fprintf(stderr, "ERROR: error opening file %s for write ops: %s\n", filename, strerror(errno));
+		fprintf(stderr, "ERROR: error opening file %s for write ops: %s\n", temp.c_str(), strerror(errno));
 		return 0;			
 	}
 
@@ -912,13 +913,18 @@ int dbSpaceImpl<is_simple>::save_file(const char *filename) {
 
 	save_stream(f);
 	f.close();
+	if (rename(temp.c_str(), filename)) {
+		fprintf(stderr, "ERROR: Can't rename %s to %s: %s\n", temp.c_str(), filename, strerror(errno));
+		return 0;
+	}
 	return 1;
 }
 
 int dbSpaceMap::save_file(const char* filename) {
-	std::ofstream f(filename, std::ios::binary);
+	std::string temp = std::string(filename) + ".temp";
+	std::ofstream f(temp.c_str(), std::ios::binary);
 	if (!f.is_open()) {
-		fprintf(stderr, "ERROR: error opening file %s for write ops: %s\n", filename, strerror(errno));
+		fprintf(stderr, "ERROR: error opening file %s for write ops: %s\n", temp.c_str(), strerror(errno));
 		return 0;			
 	}
 
@@ -936,6 +942,10 @@ fprintf(stderr, "Saving DB %d\n", dbId);
 	}
 
 	f.close();
+	if (rename(temp.c_str(), filename)) {
+		fprintf(stderr, "ERROR: Can't rename %s to %s: %s\n", temp.c_str(), filename, strerror(errno));
+		return 0;
+	}
 	return size();
 }
 

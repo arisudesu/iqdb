@@ -12,7 +12,7 @@ see the file COPYING for details.
 
 2) Running
 
-The iqdb program has to operating modes: database maintenance and query server.
+The iqdb program has two operating modes: database maintenance and query server.
 
 The maintenance mode is to update image databases: add and remove images, set
 image properties and retrieve database stats. The query server mode listens on
@@ -40,7 +40,7 @@ multiple databases at once:
 $ iqdb command foo.db bar.db baz.db
 
 This mode expects commands on stdin. For a full list see do_commands() in
-iqdb.cpp. The <dbid> argument refers to the dabase on the command line, with
+iqdb.cpp. The <dbid> argument refers to the database on the command line, with
 the first argument being dbid=0. Commands of particular interest are:
 
 	add <dbid> <imgid> [<width> <height>]:<filename>
@@ -81,9 +81,9 @@ Of particular interest are the following commands:
 			8 = consider image width:height as set ID instead and
 			    return only the best match for each set
 			16= discard common coefficients (those present in at
-			    least 10% of all images), this finds an identical
-			    match much faster but the non-matching images have
-			    less similarity
+			    least 10% of all images), this finds a
+			    near-identical match much faster but the
+			    non-matching images have less similarity
 
 	multi_query <dbid> <flags> <numres> [+ <dbid2> <flags2> <numres2> +...] <filename>
 		Merge query results from multiple databases. This adjusts the

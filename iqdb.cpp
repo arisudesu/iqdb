@@ -165,11 +165,16 @@ void add(const char* fn) {
 	dbSpaceAuto db(fn, imgdb::dbSpace::mode_normal);
 	while (!feof(stdin)) {
 		char fn[1024];
+		char line[1024];
 		imgdb::imageId id;
 		int width = -1, height = -1;
-		if (fscanf(stdin, "%lx %d %d:%1023[^\r\n]\n", &id, &width, &height, fn) != 4  &&
-		    fscanf(stdin, "%lx:%1023[^\r\n]\n", &id, fn) != 2) {
-			fprintf(stderr, "Invalid line, got %08lx %d %d:%s.\n", id, width, height, fn);
+		if (!fgets(line, sizeof(line), stdin)) {
+			fprintf(stderr, "Read error.\n");
+			continue;
+		}
+		if (sscanf(line, "%lx %d %d:%1023[^\r\n]\n", &id, &width, &height, fn) != 4  &&
+		    sscanf(line, "%lx:%1023[^\r\n]\n", &id, fn) != 2) {
+			fprintf(stderr, "Invalid line %s\n", line);
 			continue;
 		}
 		if (!db->hasImage(id)) {
@@ -283,7 +288,7 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 			int dbid;
 			if (sscanf(arg, "%i\n", &dbid) != 1) throw imgdb::param_error("Format: list <dbid>");
 			imgdb::imageId_list list = DB->getImgIdList();
-			for (size_t i = 0; i < list.size(); i++) fprintf(wr, "%08lx\n", list[i]);
+			for (size_t i = 0; i < list.size(); i++) fprintf(wr, "100 %08lx\n", list[i]);
 
 		} else if (!strcmp(command, "count")) {
 			int dbid;
@@ -383,6 +388,13 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 			fprintf(wr, "100 Setting %d:%08lx = %d:%d...\r", dbid, id, width, height);
 			DB->setImageRes(id, width, height);
 
+		} else if (!strcmp(command, "list_info")) {
+			int dbid;
+			if (sscanf(arg, "%i\n", &dbid) != 1) throw imgdb::param_error("Format: list_info <dbid>");
+			imgdb::image_info_list list = DB->getImgInfoList();
+			for (imgdb::image_info_list::iterator itr = list.begin(); itr != list.end(); ++itr)
+				fprintf(wr, "100 %08lx %d %d\n", itr->id, itr->width, itr->height);
+
 		} else if (!strcmp(command, "rehash")) {
 			int dbid;
 			if (sscanf(arg, "%d", &dbid) != 1)
@@ -433,7 +445,7 @@ void command(int numfiles, char** files) {
 		dbs[db].set(loaddb(files[db], imgdb::dbSpace::mode_normal));
 
 	try {
-		do_commands(stdin, stderr, dbs, numfiles);
+		do_commands(stdin, stdout, dbs, numfiles);
 
 	} catch (const event_t& event) {
 		if (event != DO_QUITANDSAVE) return;

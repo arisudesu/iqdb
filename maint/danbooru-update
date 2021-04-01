@@ -7,8 +7,12 @@ use URI::Escape;
 use JSON::DWIW;
 
 my $tag = shift or die "Give server tag on command line.\n";
+my $max = 0+(shift||0);
+my $cnt = 0;
+print "Getting no more than $max posts.\n" if $max > 0;
 
 our ($user,$pw,$host);
+our $ext = "js";
 do "/usr/src/packages/sim/$tag.cfg" and $user and $pw and $host or die "Can't get user/pw/host: $!\n";
 chdir "$ENV{HOME}/doujin/$tag" or die "Can't chdir: $!\n";
 open my $last_post, "<", ".lastid" or die "Can't read .lastid: $!\n";
@@ -23,7 +27,7 @@ my $ua = MyUserAgent->new;
 $ua->timeout(10);
 $ua->env_proxy;
 
-#$response = file("http://$host/post/index.js?limit=50&login=$user&password_hash=$pw&tags=id%3A172410..172420");
+#$response = file("http://$host/post/index.$ext?limit=50&login=$user&password_hash=$pw&tags=id%3A172410..172420");
 my @commands;
 my @deleted;
 my $warn = 0;
@@ -37,8 +41,8 @@ if (-M ".last_deleted" > 0.9) {
 while(defined $last_del) {
 utime time, time, ".last_deleted" or die "Can't touch .last_deleted: $!\n";
 print "Getting deleted after $last_del...\n";
-#my ($response,$error) = $json->from_json(get "http://$host/post/index.js?login=$user&password_hash=$pw&tags=".uri_escape "id:>$last_del order:id deleted:true");
-my $response = $ua->get_json("http://$host/post/index.js?limit=100&login=$user&password_hash=$pw&tags=".uri_escape "id:>$last_del order:id deleted:true");
+#my ($response,$error) = $json->from_json(get "http://$host/post/index.$ext?login=$user&password_hash=$pw&tags=".uri_escape "id:>$last_del order:id deleted:true");
+my $response = $ua->get_json("http://$host/post/index.$ext?limit=100&login=$user&password_hash=$pw&tags=".uri_escape "id:>$last_del order:id deleted:true");
 last unless @$response;
 for (@$response) {
 	$last_del = $_->{id};
@@ -52,11 +56,12 @@ for (@$response) {
 	rename $fn,$target  or die "Can't rename $fn to $target: $!\n";
 }
 }
-while(1) {
-my $response = $ua->get_json("http://$host/post/index.js?limit=100&login=$user&password_hash=$pw&tags=".uri_escape "id:>$last_post order:id");
+while(!$max or $cnt < $max) {
+my $response = $ua->get_json("http://$host/post/index.$ext?limit=100&login=$user&password_hash=$pw&tags=".uri_escape "id:>$last_post order:id");
 last unless @$response;
 my $err = 0;
 for (@$response) {
+	$cnt++;
 	die "Invalid row (no ID): $_\n" unless $_->{id};
 
 	my $id = $_->{id};
@@ -68,7 +73,7 @@ for (@$response) {
 	my $md5 = $_->{md5};
 	die "Invalid md5: $md5\n" unless length $md5 == 32;
 	if ($url =~ m#/(default|download|deleted)\.png$#) {
-		print "$id: $url SKIPPED\n";
+		print "$id: $url SKIPPED\n" unless $max;
 		next;
 	}
 
@@ -79,8 +84,11 @@ for (@$response) {
 	my ($file,$suf) = ($md5, substr $url, rindex $url, ".");
 	$file =~ /^(.)(.)(.)/;
 	$file = "$1/$2/$3/$file$suf";
-	print "$id: $url -> $file: ";
-	print "Exists.\n" and next if -e $file;
+	print "$id: $url -> $file: " unless $max;
+	if (-e $file) {
+		print "Exists.\n" unless $max;
+		next;
+	}
 	my $tmpfile = "new/$md5$suf";
 
 	my $res = $ua->mirror($url, $tmpfile);
@@ -135,14 +143,28 @@ sub get_json {
 	#open my $json, ">", "last.js" or die; print $json $res->content; close $json;
 
 	$res = $res->content;
-	while ($res =~ s/(\\(['"]))//g) {
-		warn "Escaped quote: $1. Removed.\n";
-		#$warn++;
-	}
+	#while ($res =~ s/(\\['"])//g) {
+	#	warn "Escaped quote: $1. Removed.\n";
+	#	#$warn++;
+	#}
 	#open my $json, ">", "last.jsf" or die; print $json $res; close $json;
 	#print STDERR "Parsing...";
-	$res = JSON::DWIW::deserialize $res;
+	#my $data = JSON::DWIW::deserialize $res;
 	#print STDERR "done.\n";
-	die "JSON returned ".JSON::DWIW::get_error_string()."\n" unless defined $res;
-	return $res;
+	my $data = $res;
+	$data =~ s/(["']\s*):/$1=>/g;
+	$data =~ s/\bnull\b/undef/g;
+	$data =~ s/\btrue\b/1/g;
+	$data =~ s/\bfalse\b/0/g;
+	$data =~ s/([\$\@])/\\$1/g;
+	my $out = eval $data;
+	return $out if defined $out;
+	chdir "/usr/src/packages/sim";
+	open my $dump, ">", "last.json";
+	print $dump $res;
+	close $dump;
+	open $dump, ">", "last.jsonp";
+	print $dump $data;
+	close $dump;
+	die "JSON parsing failed: $@\n";
 }

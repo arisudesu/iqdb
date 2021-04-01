@@ -1,0 +1,3 @@
+- make cache files optional?
+- instead of not ignoring MD5, change to always change MD5+tag like now, no need to check ignbase
+- fix dupe finder

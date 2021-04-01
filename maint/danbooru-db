@@ -42,6 +42,15 @@ for (sort keys %dup) {
 	#print "$_ is ok" and 
 		next if m#/xx/#;
 	$o = $_;
+	s#((?:/[0-9a-f]){3})/#/xx/*-# or die "$_";
+	my @f = glob $_;
+	$_ = $o;
+	if (@f == 1) {
+		print "$o already is $f[0], deleting new.\n";
+		die "But file sizes differ!\n" unless -s $f[0] == -s;
+		unlink $_ or die "Can't unlink $_: $!\n";
+		next;
+	}
 	do { $r = sprintf "%08x", 1 + rand 0xfffffffd } while $d{$r};
 	$d{$r} = 1;
 	s#((?:/[0-9a-f]){3})/#/xx/$r-# or die "$_";
@@ -79,6 +88,7 @@ print "Adding images...\n";
 find ({wanted=>\&add, no_chdir=>1}, ".");
 print "Setting resolutions...\n";
 open my $res, "<", "/usr/src/packages/sim/$tag.res" or warn "Can't read $tag.res: $!\n";
+open my $reslog, "|bzip2 -c >> ~/stuff/$tag.res.bz2" or warn "Can't start bzip2: $!\n";
 while (<$res>) {
 	my ($md5,$width,$height) = split " ";
 	/(.)(.)(.)/;
@@ -88,10 +98,12 @@ while (<$res>) {
 	$_ = $f[0];
 	my @id = get_id;
 	print $imgSeek "set_res 0 $id[0] $width $height\n";
+	print $reslog "$md5 $width $height\n";
 }
 print "Saving...\n";
 print $imgSeek "quit now\n";
 close $imgSeek or die "Can't close imgSeek: $!\n";
+close $reslog or die "Can't close reslog: $!\n";
 unlink "/usr/src/packages/sim/$tag.res" or warn "Can't delete $tag.res: $!\n";
 
 print "Moving deleted files...";
