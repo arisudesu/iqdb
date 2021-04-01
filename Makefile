@@ -1,3 +1,20 @@
+# Some configuration options
+#----------------------------
+
+# In simple mode, by default all data needed for queries is now
+# read into memory, using in total about 500 bytes per image. It
+# is possible to select a disk cache using mmap for this instead.
+# Then the kernel can read this memory into the filecache or
+# discard it as needed. The app uses as little memory as possible
+# but depending on IO load queries can take longer (sometimes a lot).
+# This option is especially useful for a VPS with little memory.
+# DEFS+=-DUSE_DISK_CACHE
+
+# If you do not have any databases created by previous versions of
+# this software, you can uncomment this to not compile in code for
+# upgrading old versions (use iqdb rehash <dbfile> to upgrade).
+# DEFS+=-DNO_SUPPORT_OLD_VER
+
 
 .SUFFIXES:
 
@@ -7,6 +24,7 @@ all:	iqdb
 %.o : %.cpp
 iqdb.o : imgdb.h haar.h auto_clean.h
 imgdb.o : imgdb.h imglib.h haar.h auto_clean.h
+test-db.o : imgdb.h
 haar.o :
 %.le.o : %.h
 iqdb.le.o : imgdb.h haar.h auto_clean.h

@@ -1,6 +1,7 @@
 #!/usr/bin/perl
 use File::Find;
 
+#system("renice 15 $$");
 my $tag = shift or die "Give server tag on command line.\n";
 chdir "$ENV{HOME}/doujin/$tag" or die "Can't chdir: $!\n";
 my $db_file = "$ENV{HOME}/stuff/$tag.idb";
@@ -60,6 +61,32 @@ for (sort keys %dup) {
 print "$total files examined.\n";
 undef %dup;
 
+if (-e "/usr/src/packages/sim/$tag.md5_list") {
+	my %allowed;
+	print "Reading MD5 list... ";
+	open my $lst, "<", "/usr/src/packages/sim/$tag.md5_list" or die "Can't read: $!\n";
+	while (<$lst>) {
+		chomp;
+		$allowed{$_} = 1;
+	}
+	$check = 1;
+	print "got ", scalar keys %allowed, " entries.\n";
+	sub check {
+		return unless -f;
+		return if m#\.last# or m#/deleted/# or m#/todelete/#;
+		/([a-f0-9]{32})/ or print "Not MD5: $_\n" and return;
+		return if $allowed{$1};
+		print "NOT ALLOWED: $1 = $_\n";
+		my $o = $_;
+		s#.*/#./todelete/#;
+		print "Moving $o to $_\n";
+		rename $o, $_ or die "Can't rename: $!\n";
+	}
+	find ({wanted=>\&check, no_chdir=>1}, ".");
+	print "All images checked.\n";
+	unlink "/usr/src/packages/sim/$tag.md5_list" or die "Can't delete MD5 list: $!\n";
+}
+
 print "Removing images...\n";
 #open my $imgSeek, ">&STDOUT" or die;
 open my $imgSeek, "|-", "$ENV{HOME}/bin/imgSeek", "command", $db_file or die "Can't run imgSeek: $!\n";
@@ -80,10 +107,10 @@ sub remove {
 	print $imgSeek "remove 0 $id\n";
 }
 find ({wanted=>\&remove, no_chdir=>1}, "todelete");
-if (@deleted) {
-	print scalar @deleted, " images removed. Rehashing.\n";
-	print $imgSeek "rehash 0\n";
-}
+#if (@deleted) {
+#	print scalar @deleted, " images removed. Rehashing.\n";
+#	print $imgSeek "rehash 0\n";
+#}
 print "Adding images...\n";
 find ({wanted=>\&add, no_chdir=>1}, ".");
 print "Setting resolutions...\n";

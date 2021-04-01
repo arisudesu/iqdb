@@ -2,13 +2,18 @@
 
 # Connect to iqdb server, send it a command and parse the replies.
 function request_srv($line) {
-	global $iqdb_host, $iqdb_port;
+	global $iqdb_host, $iqdb_port, $iqdb_restart_cmd;
 
-	for ($try = 0; $try < 5; $try++) {
-		@$fp = fsockopen($iqdb_host, $iqdb_port, $errno, $errstr, 10);
+	for ($try = 0; $try < 3; $try++) {
+		@$fp = fsockopen($iqdb_host, $iqdb_port, $errno, $errstr, 3);
 		if ($fp) break;
 
-		#debug("Can't connect, try=$try"); flush();
+		debug("Can't connect, errno=$errno errstr=$errstr try=$try"); flush();
+		if ($errno == 111 /* ECONNREFUSED */ && $try == 2 && $iqdb_restart_cmd) {
+			debug("Trying to restart iqdb: $iqdb_restart_cmd");
+			exec($iqdb_restart_cmd, $out);
+			debug("Output:\n".join("\n",$out),"\n");
+		}
 		sleep(2);
 	}
 
@@ -76,7 +81,7 @@ function request_match($file, $querysrv, $options = array()) {
 		$query = $res."multi_query$query $file\ndone now\n";
 		#debug("Doing multi query:\n$query");
 		$res = request_srv($query);
-		$res["results"] = array_slice($res["results"], 0, $numres);
+		if ($res["results"]) $res["results"] = array_slice($res["results"], 0, $numres);
 	} else {
 		$srv=$services[$services[$querysrv]];
 		$db = $srv["db"];
@@ -100,9 +105,9 @@ function request_match($file, $querysrv, $options = array()) {
 		$srv = $services[$services[$dbid]];
 		if ($srv["process"]) {
 			$arg = array("dbid" => $dbid, "id" => $id, "sim" => $sim, "width" => $width, "height" => $height, "file" => $file);
-			$res = $srv["process"]($arg);
-			if ($res["err"]) return array('err' => $res["err"]);
-			array_push($result["match"], $res);
+			$match = $srv["process"]($arg);
+			if ($match["err"]) return array('err' => $match["err"]);
+			array_push($result["match"], $match);
 			continue;
 		}
 
@@ -120,7 +125,7 @@ function request_match($file, $querysrv, $options = array()) {
 	$dbtime = microtime_float() - $start;
 	#debug("Got ".count($res["results"])." results parsed into ".count($result["match"])." matches.");
 	if (count($res["results"]) && !count($result["match"])) return array('err' => "Thumbnails not found.");
-	if (!count($result["match"])) return array('err' => "Database error: ".$res["err"]);
+	if (!count($result["match"])) return array('err' => "Database error: ".($res["err"]?$res["err"]:"No matches returned."));
 	$result["stats"] = sprintf("query %.3fs db %.3fs", $time, $dbtime);
 	return $result;
 }
@@ -148,15 +153,16 @@ function process_match($match, $ignoremd5 = false, $ignoretag = '') {
 		$minrel = 90;
 	} else {
 		foreach ($match as $page) {
-			#debug("Checking sim=".$page['sim'].", avg=$mavg stddev=$mstddev minrel=$minrel");
+			#debug("Checking sim=".$page['sim'].", sum=$sum sqsum=$sqsum avg=$avg stddev=$stddev minrel=$minrel count=$count");
 			if ($page['sim'] < $minrel) break;
-			if (!--$count) break;
 			$thres["numrel"]++;
+			if ($ignoremd5 && $page["md5"] === $ignoremd5 && $page["tag"] === $ignoretag) continue;
+			if (!--$count) break;
 			$sum -= $page['sim'];
 			$sqsum -= $page['sim'] * $page['sim'];
 			$avg = $sum/$count;
 			$stddev = sqrt($sqsum/$count - $avg*$avg);
-			if ($stddev < 5) break;
+			if ($stddev < 5) continue;
 			$minrel = $avg + $stddev/2;
 		}
 	}

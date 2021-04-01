@@ -65,104 +65,153 @@ public:
 
 typedef dbSpaceAuto dbSpaceAutoList[];
 
-inline dbSpaceAuto& check(dbSpaceAutoList dbs, int ndbs, int dbid) {
+inline dbSpaceAuto& check(dbSpaceAutoList dbs, unsigned int ndbs, unsigned int dbid) {
 	if (dbid >= ndbs)
 		throw imgdb::param_error("dbId out of range.");
 	return dbs[dbid];
 }
 
-void std_dev(const imgdb::sim_vector& sim, imgdb::Score* average, imgdb::Score* stddev) {
+#define ScD(x) ((double)(x)/imgdb::ScoreMax)
+#define DScD(x) ScD(((x)/imgdb::ScoreMax))
+
+// Minimum score to consider an image a relevant match. Starting from the end of the list
+// (least similar), average and standard deviation are computed. When the std.dev. exceeds
+// the min_stddev value, the minimum score is then avg + stddev * stddev_fract.
+imgdb::Score min_sim(const imgdb::sim_vector& sim, imgdb::Score min_stddev, imgdb::Score stddev_frac) {
+	imgdb::DScore min_sqd = (imgdb::DScore)min_stddev * min_stddev;
 	imgdb::DScore sum = 0;
 	imgdb::DScore sqsum = 0;
+	int cnt = 0;
+	if (sim.size() < 2) return -1;
+	for (imgdb::sim_vector::const_iterator itr = sim.end() - 1; itr != sim.begin(); --itr) {
+		if (itr->score < 0) continue;
 
-	for (imgdb::sim_vector::const_iterator itr = sim.begin() + 1; itr != sim.end(); ++itr) {
-		if (itr->score < 0) break;
+		cnt++;
 		sum += itr->score;
 		sqsum += (imgdb::DScore)itr->score * itr->score;
-	}
-	int cnt = sim.size() - 1;
-	if (cnt < 1) { *average = 0; *stddev = 0; return; }
 
-	*average = sum / cnt;
-	*stddev = lrint(sqrt((double)sqsum / cnt - (double)*average * *average));
-//fprintf(stderr, "cnt=%d sum=%.1f avg=%.1f sqsum=%.1f stddev=%.1f=%.1f\n", cnt, (double)sum/imgdb::ScoreMax, (double)*average/imgdb::ScoreMax, (double)sqsum/imgdb::ScoreMax, sqrt((double)sqsum / cnt - (double)*average * *average) / imgdb::ScoreMax, (double)*stddev/imgdb::ScoreMax);
+		if (cnt < 2) continue;
+
+		imgdb::DScore avg = sum / cnt;
+		imgdb::DScore sqd = sqsum - sum * avg;
+		//imgdb::Score stddev = lrint(sqrt((double)sqd/cnt));
+		//imgdb::Score min_sim = avg + (((imgdb::DScore)stddev_frac * stddev) >> imgdb::ScoreScale);
+//fprintf(stderr, "Got %d. sum=%.1f avg=%.1f sqsum=%.1f² stddev=%.1f. Want %.1f of min=%.1f = %.1f\n", 
+//cnt, ScD(sum), ScD(avg), ScD(sqrt(sqsum)), ScD(stddev), ScD(stddev_frac), ScD(min_stddev), DScD((((imgdb::DScore)stddev_frac * stddev))));
+		if (sqd > min_sqd * cnt) return avg + lrint((double)stddev_frac * sqrt(sqd/cnt) / imgdb::ScoreMax);
+	}
+	return -1;
 }
 
-typedef std::map<imgdb::imageId,double> dupe_set;
-/*struct dupe_set_ref {
-	dupe_set_ref(dupe_set& s) : m_set(&s) { };
-	dupe_set& set() { return *m_set; };
-	dupe_set* m_set;
-};*/
-//typedef std::map<imageid, dupe_set_ref> dupe_list;
-struct dupe_list : public std::map<imgdb::imageId, dupe_set*> {
-	typedef std::map<imgdb::imageId, dupe_set*> base_type;
-	struct accessor : public base_type::iterator {
-		accessor(const base_type::iterator& itr) : base_type::iterator(itr) { };
-		dupe_set& set() { return *(*this)->second; }
-		imgdb::imageId   id()  { return (*this)->first; }
-	};
+class dupe_list : private std::vector<imgdb::sim_vector> {
+public:
+	typedef std::vector<imgdb::sim_vector> base_type;
+	using base_type::at;
+	using base_type::size;
+
+	typedef std::map<imgdb::imageId,size_t> dupe_map;
+	typedef dupe_map::iterator dupe_set;
+
+	dupe_set not_found() { return m_map.end(); }
+	dupe_set find(imgdb::imageId id) { return m_map.find(id); }
+	dupe_set create_set(imgdb::imageId id) {
+		push_back(base_type::value_type());
+		return m_map.insert(dupe_map::value_type(id, size() - 1)).first;
+	}
+	void merge(size_t set, imgdb::sim_vector& from) {
+		for (imgdb::sim_vector::iterator itr = from.begin(); itr != from.end(); ++itr)
+			m_map[itr->id] = set;
+
+		imgdb::sim_vector& list = at(set);
+		list.insert(list.end(), from.begin(), from.end());
+		from.clear();
+	}
+	void print(FILE *f) {
+		for (iterator itr = begin(); itr != end(); ++itr) {
+			if (itr->empty()) continue;
+			for (imgdb::sim_vector::iterator sItr = itr->begin(); sItr != itr->end(); ++sItr)
+				fprintf(f, "%s%08lx", sItr == itr->begin() ? "" : " ", sItr->id);
+			fprintf(f, "\n");
+		}
+	}
+
+private:
+	dupe_map m_map;
 };
 
-void find_duplicates(const char* fn) {
+struct id_not_below : public std::unary_function<imgdb::sim_value,bool> {
+	id_not_below(imgdb::imageId base) : m_base(base) { }
+	bool operator() (const imgdb::sim_value& sim) { return sim.id >= m_base; }
+	imgdb::imageId m_base;
+};
+
+void find_duplicates(const char* fn, int mindev) {
+	/* for testing stddev code...
+	int scores[] = { 84, 71, 67, 52, 43, 41, 40, 40, 39, 39, 39, 39, 38, 38, 38, 38, 38 };
+	imgdb::sim_vector sim;
+	for (unsigned int i =0; i < sizeof(scores)/sizeof(scores[0]); i++)
+		sim.push_back(imgdb::sim_value(i, scores[i] << imgdb::ScoreScale, 0, 0));
+	imgdb::Score m = min_sim(sim, 5 << imgdb::ScoreScale, imgdb::ScoreMax / 2);
+fprintf(stderr, "Min score: %.1f\n", ScD(m));
+	return;
+	*/
 	dbSpaceAuto db(fn, imgdb::dbSpace::mode_readonly);
 
-	std::vector<dupe_set> dupe_sets;
 	dupe_list dupes;
 
 	imgdb::imageId_list images = db->getImgIdList();
 	for (imgdb::imageId_list::const_iterator itr = images.begin(); itr != images.end(); ++itr) {
 		fprintf(stderr, "%3zd%%\r", 100*(itr - images.begin())/images.size());
-		imgdb::sim_vector sim = db->queryImgID(*itr, 16);
+		imgdb::sim_vector sim = db->queryImgID(*itr, 16, imgdb::dbSpace::flag_onlyabove | imgdb::dbSpace::flag_nocommon);
 
-		imgdb::Score avg, stddev;
-		std_dev(sim, &avg, &stddev);
+		// This is not needed when imgdb::dbSpace::flag_onlyabove starts working:
+		sim.erase(std::partition(sim.begin(), sim.end(), id_not_below(*itr)), sim.end());
+
+		imgdb::Score min = min_sim(sim, mindev << imgdb::ScoreScale, imgdb::ScoreMax / 2);
 //fprintf(stderr, "%08lx got %4.1f +/- %4.1f: ", *itr, (double)avg/imgdb::ScoreMax, (double)stddev/imgdb::ScoreMax);
 //for (size_t i = 1; i < sim.size(); i++) fprintf(stderr, "%08lx:%4.1f ", sim[i].first, (double)sim[i].second/imgdb::ScoreMax);
 //fprintf(stderr, "\n");
+		if (min < 0) continue;
 
-		if (stddev < (5 << imgdb::ScoreScale) && sim[1].score < (95 << imgdb::ScoreScale)) continue;
-		avg += stddev/2;
-		imgdb::sim_vector reduced;
-		for (imgdb::sim_vector::const_iterator sItr = sim.begin() + 1; sItr != sim.end() && sItr->score > avg; ++sItr)
-			if (sItr->id > *itr) reduced.push_back(*sItr);
-		if (reduced.empty()) continue;
+		dupe_list::dupe_set set = dupes.not_found();
+		for (imgdb::sim_vector::iterator sItr = sim.begin(); sItr != sim.end(); ++sItr) {
+			if (sItr->score < min) {
+				sim.erase(sItr, sim.end());
+				break;
+			}
 
-		fprintf(stdout, "%08lx", *itr);
-		for (imgdb::sim_vector::const_iterator sItr = reduced.begin(); sItr != reduced.end() && sItr->score > avg; ++sItr)
-			fprintf(stdout, " %08lx:%.1f", sItr->id, (double)sItr->score / imgdb::ScoreMax);
-		fprintf(stdout, "\n");
-/*
+			dupe_list::dupe_set itr = dupes.find(sItr->id);
+			if (itr == dupes.not_found()) continue;
+			if (set == dupes.not_found()) {
+//fprintf(stderr," ID %08lx joining set %08lx:%zd.\n", sItr->id, itr->first, itr->second);
+				set = itr;
+				continue;
+			}
+			if (itr->second == set->second) continue;
 
-		dupe_list::accessor dItr = dupes.find(*itr);
-		imgdb::sim_vector::const_iterator sItr;
-		for (sItr = sim.begin() + 1; dItr == dupes.end() && sItr != sim.end(); ++sItr)
-			dItr = dupes.find(sItr->first);
-
-		if (dItr == dupes.end()) {
-fprintf(stderr, "Making new set: %zd\n", dupe_sets.size());
-			dupe_sets.push_back(dupe_set());
-			dItr = dupes.insert(std::make_pair(*itr, &dupe_sets.back())).first;
-		} else {
-			double img_sim = calcSim(0, *itr, dItr->first, isImageGrayscale(0, *itr));
-fprintf(stderr, "Adding to set %p of %08lx. Has sim=%4.1f.\n", &dItr.set(), dItr.id(), img_sim);
-			dItr.set()[*itr] = img_sim;
-			dupes[*itr] = dItr->second;
+			// Two IDs from this dupe set are already in two different sets. Merge second set to first.
+//fprintf(stderr, "ID %08lx already in set %08lx:%zd and also have %08lx:%zd. Merging. ", sItr->id, itr->first, itr->second, set->first, set->second);
+			dupes.merge(set->second, dupes.at(itr->second));
+//fprintf(stderr, "Now %zd has %zd, and %zd has %zd.\n", set->second, dupes.at(set->second).size(), itr->second, dupes.at(itr->second).size());
 		}
 
-		for (sItr = sim.begin() + 1; sItr != sim.end() && sItr->second > avg; ++sItr) {
-			dItr.set()[sItr->first] = std::max(sItr->second, dItr.set()[sItr->first]);
-			dupes[sItr->first] = dItr->second;
+		if (set == dupes.not_found()) {
+			set = dupes.create_set(sim[0].id);
+//fprintf(stderr, "ID %08lx creating new set %08lx:%zd.\n", sim[0].id, set->first, set->second);
 		}
-fprintf(stderr, "Set %p of %08lx now has %zd dupes, %zd total: ", &dItr.set(), dItr.id(), dItr.set().size(), dupes.size());
-for (dupe_set::iterator i = dItr.set().begin(); i != dItr.set().end(); ++i) fprintf(stderr, "%08lx:%4.1f ", i->first, i->second);
-fprintf(stderr, "\n");
-*/
+
+		dupes.merge(set->second, sim);
+//		fprintf(stderr, "Set %zd now: ", set->second);
+//		for (imgdb::sim_vector::const_iterator itr = dupes.at(set->second).begin(); itr != dupes.at(set->second).end(); ++itr)
+//			fprintf(stderr, " %08lx:%.1f", itr->id, ScD(itr->score));
+//		fprintf(stderr, "\n");
 	}
+
+	dupes.print(stdout);
 }
 
 void add(const char* fn) {
-	dbSpaceAuto db(fn, imgdb::dbSpace::mode_normal);
+	dbSpaceAuto db(fn, imgdb::dbSpace::mode_alter);
 	while (!feof(stdin)) {
 		char fn[1024];
 		char line[1024];
@@ -177,12 +226,15 @@ void add(const char* fn) {
 			fprintf(stderr, "Invalid line %s\n", line);
 			continue;
 		}
-		if (!db->hasImage(id)) {
-			fprintf(stderr, "Adding %s = %08lx...\r", fn, id);
-			db->addImage(id, fn);
-		}
-		if (width != -1 && height != -1 && db->hasImage(id)) {
-			db->setImageRes(id, width, height);
+		try {
+			if (!db->hasImage(id)) {
+				fprintf(stderr, "Adding %s = %08lx...\r", fn, id);
+				db->addImage(id, fn);
+			}
+			if (width != -1 && height != -1)
+				db->setImageRes(id, width, height);
+		} catch (const imgdb::simple_error& err) {
+                	fprintf(stderr, "%s: %s %s\n", fn, err.type(), err.what());
 		}
 	}
 	db->save_file(fn);
@@ -229,7 +281,7 @@ void diff(const char* fn, imgdb::imageId id1, imgdb::imageId id2) {
 
 void sim(const char* fn, imgdb::imageId id, int numres) {
 	dbSpaceAuto db(fn, imgdb::dbSpace::mode_readonly);
-	imgdb::sim_vector sim = db->queryImgID(id, numres);
+	imgdb::sim_vector sim = db->queryImgID(id, numres, 0);
 	for (size_t i = 0; i < sim.size(); i++)
 		printf("%08lx %lf %d %d\n", sim[i].id, (double)sim[i].score / imgdb::ScoreMax, sim[i].width, sim[i].height);
 }
@@ -242,7 +294,7 @@ typedef std::pair<imgdb::sim_value,int> sim_db_value;
 struct cmp_sim_high : public std::binary_function<sim_db_value,sim_db_value,bool> {
 	bool operator() (const sim_db_value& one, const sim_db_value& two) { return two.first.score < one.first.score; }
 };
-struct query_t { int dbid, numres, flags; };
+struct query_t { unsigned int dbid, numres, flags; };
 
 void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 	while (!feof(rd)) try {
@@ -333,13 +385,18 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 				// Pull score of following hit down to 0%, keeping 100% a fix point, then
 				// merge and sort list, and pull up 0% to the minimum noise level again.
 				// This assumes that result numres+1 is indeed noise, so numres must not
-				// be too small.
+				// be too small. And if we got fewer images than we requested, the DB
+				// doesn't even have that many and hence the noise floor is zero.
 				imgdb::Score sim_min = dbsim.back().score;
+				if (dbsim.size() < itr->numres + 1)
+					sim_min = 0;
+				else
+					dbsim.pop_back();
+
 				merge_min = std::min(merge_min, sim_min);
 				imgdb::DScore slope = sim_min == 100 * imgdb::ScoreMax ? imgdb::ScoreMax : 
 					(((imgdb::DScore)100 * imgdb::ScoreMax) << imgdb::ScoreScale) / (100 * imgdb::ScoreMax - sim_min);
 				imgdb::DScore offset = - slope * sim_min;
-				dbsim.pop_back();
 
 				for (imgdb::sim_vector::iterator sitr = dbsim.begin(); sitr != dbsim.end(); ++sitr) {
 					sitr->score = (slope * sitr->score + offset) >> imgdb::ScoreScale;
@@ -362,13 +419,13 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 				throw imgdb::param_error("Format: add <dbid> <imgid>[ <width> <height>]:<filename>");
 
 			// Could just catch imgdb::param_error, but this is so common here that handling it explicitly is better.
-			if (DB->hasImage(id)) {
-				//fprintf(wr, "300 Already in db %d: %08lx:%s\n", dbid, id, fn);
-				continue;
+			if (!DB->hasImage(id)) {
+				fprintf(wr, "100 Adding %s = %d:%08lx...\r", fn, dbid, id);
+				DB->addImage(id, fn);
 			}
 
-			fprintf(wr, "100 Adding %s = %d:%08lx...\r", fn, dbid, id);
-			DB->addImage(id, fn);
+			if (width > 0 && height > 0)
+				DB->setImageRes(id, width, height);
 
 		} else if (!strcmp(command, "remove")) {
 			imgdb::imageId id;
@@ -406,7 +463,7 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 		} else if (!strcmp(command, "saveas")) {
 			char fn[1024];
 			int dbid;
-			if (sscanf(arg, "%d %[^\r\n]\n", &dbid, fn) != 2)
+			if (sscanf(arg, "%d %1023[^\r\n]\n", &dbid, fn) != 2)
 				throw imgdb::param_error("Format: saveas <dbid> <file>");
 
 			fprintf(wr, "100 Saving DB %d to %s...\n", dbid, fn);
@@ -442,7 +499,7 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 void command(int numfiles, char** files) {
 	dbSpaceAuto dbs[numfiles];
 	for (int db = 0; db < numfiles; db++)
-		dbs[db].set(loaddb(files[db], imgdb::dbSpace::mode_normal));
+		dbs[db].set(loaddb(files[db], imgdb::dbSpace::mode_alter));
 
 	try {
 		do_commands(stdin, stdout, dbs, numfiles);
@@ -630,7 +687,9 @@ int main(int argc, char** argv) {
 	} else if (!strcasecmp(argv[1], "rehash")) {
 		rehash(filename);
 	} else if (!strcasecmp(argv[1], "find_duplicates")) {
-		find_duplicates(filename);
+		int mindev = strtol(argv[3], NULL, 0);
+		if (mindev < 1 || mindev > 99) mindev = 10;
+		find_duplicates(filename, mindev);
 	} else if (!strcasecmp(argv[1], "command")) {
 		command(argc-2, argv+2);
 	} else if (!strcasecmp(argv[1], "listen")) {
@@ -645,6 +704,11 @@ int main(int argc, char** argv) {
 
 	//closeDbase();
 	//fprintf(stderr, "database closed.\n");
+
+  // Handle this specially because it means we need to fix the DB before restarting :(
+  } catch (const imgdb::data_error& err) {
+	fprintf(stderr, "Data error: %s.\n", err.what());
+	exit(10);
 
   } catch (const imgdb::generic_error& err) {
 	fprintf(stderr, "Caught error %s: %s.\n", err.type(), err.what());

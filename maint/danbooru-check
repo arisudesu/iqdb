@@ -1,0 +1,108 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+use URI::Escape;
+use JSON::DWIW;
+
+my $tag = shift or die "Give server tag on command line.\n";
+my $max = 0+(shift||0);
+my $cnt = 0;
+print "Getting no more than $max posts.\n" if $max > 0;
+
+our ($user,$pw,$host);
+our $ext = "js";
+do "/usr/src/packages/sim/$tag.cfg" and $user and $pw and $host or die "Can't get user/pw/host: $!\n";
+chdir "$ENV{HOME}/doujin/$tag" or die "Can't chdir: $!\n";
+open my $last_post, "<", ".lastcheck" or die "Can't read .lastcheck: $!\n";
+$last_post = <$last_post>;
+die "Could not get last post.\n" unless defined $last_post;
+$last_post = 0 + $last_post;
+print "Last post checked: $last_post\n";
+
+open my $fres, ">>", "/usr/src/packages/sim/$tag.md5_list" or die "Can't write $tag.md5_list: $!\n";
+
+my $ua = MyUserAgent->new;
+$ua->timeout(10);
+$ua->env_proxy;
+$ua->default_header("Accept-Encoding" => "gzip, deflate");
+$ua->agent("iqdb/0.1 (+http://iqdb.yi.org/)");
+
+my $warn = 0;
+$|=1;
+while(!$max or $cnt < $max) {
+my $response = $ua->get_json("http://$host/post/index.$ext?limit=100&login=$user&password_hash=$pw&tags=".uri_escape "id:>$last_post order:id");
+last unless @$response;
+my $err = 0;
+for (@$response) {
+	$cnt++;
+	die "Invalid row (no ID): $_\n" unless $_->{id};
+
+	my $id = $_->{id};
+	$last_post=$id if $id > $last_post;
+
+	die "Invalid row (no URL): $_\n" unless $_->{preview_url};
+	my $url = $_->{preview_url};
+
+	my $md5 = $_->{md5};
+	die "Invalid md5: $md5\n" unless length $md5 == 32;
+	if ($url =~ m#/(default|download|deleted)\.png$#) {
+		print "$id: $url SKIPPED\n" unless $max;
+		next;
+	}
+
+	print $fres "$md5\n";
+}
+die "Had errors.\n" if $err;
+
+print "Last post: $last_post\n";
+open my $out, ">", ".lastcheck" or die "Can't write .lastcheck: $!\n";
+print $out $last_post or die $!;
+close $out or die $!;
+}
+
+die "Had $warn warnings.\n" if $warn > 4;
+warn "Had $warn warnings.\n" if $warn;
+
+package MyUserAgent;
+use base qw(LWP::UserAgent);
+sub prepare_request {
+	my $self = shift;
+	my $req = $self->SUPER::prepare_request(shift);
+	$req->header(Referer => "http://$host/");
+	return $req;
+}
+sub get_json {
+	my ($self,$url) = @_;
+	my $res = $self->get($url);
+	die "Could not get json response: ".$res->status_line.".\nURL was: $url\n" unless $res->is_success;
+	#open my $json, ">", "last.js" or die; print $json $res->content; close $json;
+
+	my $decoded = $res->decoded_content();
+	die "Could not decode content: $@\nURL was: $url\nUndecoded length is ".length $res->content,"\n" unless $decoded;
+	#while ($res =~ s/(\\['"])//g) {
+	#	warn "Escaped quote: $1. Removed.\n";
+	#	#$warn++;
+	#}
+	#open my $json, ">", "last.jsf" or die; print $json $res; close $json;
+	#print STDERR "Parsing...";
+	#my $data = JSON::DWIW::deserialize $res;
+	#print STDERR "done.\n";
+	my $data = $decoded;
+	$data =~ s/(["']\s*):/$1=>/g;
+	$data =~ s/\bnull\b/undef/g;
+	$data =~ s/\btrue\b/1/g;
+	$data =~ s/\bfalse\b/0/g;
+	$data =~ s/([\$\@])/\\$1/g;
+	my $out = eval $data;
+	return $out if defined $out;
+	chdir "/usr/src/packages/sim";
+	open my $dump, ">", "last.json";
+	print $dump $decoded;
+	close $dump;
+	open $dump, ">", "last.jsonp";
+	print $dump $data;
+	close $dump;
+	die "JSON parsing failed: $@\n";
+}

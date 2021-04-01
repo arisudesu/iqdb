@@ -1,0 +1,20 @@
+iqdb-20080417:
+- load data needed for queries into memory in readonly/simple mode
+  (can be disabled by editing the Makefile configuration)
+- removed support for multiple DBs in one file
+- added support for direct manipulation of file (adding/removing pics)
+  for faster updates
+- added support for add/remove in simple/readonly mode as well, though
+  these modifications can obviously not be saved and so need to be
+  done both in memory and the DB file
+- the "command" and "add" options now use the new alter mode, hence
+  queries are not supported (along with some other info commands)
+- corrupt database data now causes iqdb to abort with exit code 10.
+  this indicates that restarting it is useless until the DB is fixed.
+
+iqdb-20080303:
+- preliminary find_duplicates function
+- refactored web interface into frontend and XML backend
+
+iqdb-20080218:
+- first published version

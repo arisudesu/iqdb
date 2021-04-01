@@ -14,16 +14,28 @@ if ! lockfile -r 0 update.lock; then
 fi
 trap "rm -f update.lock" SIGHUP SIGINT SIGQUIT SIGTERM EXIT
 
-export http_proxy=http://localhost:3128/
-./danbooru-update danbooru   || let EC=$EC+2
-./danbooru-update konachan   || let EC=$EC+2
-./danbooru-update moe.imouto || let EC=$EC+2
-./danbooru-db danbooru   || let EC=$EC+16;
-./danbooru-db konachan   || let EC=$EC+16;
-./danbooru-db moe.imouto || let EC=$EC+16;
+if [ "$1" = "update" ]; then
+	echo Update
+
+	export http_proxy=http://localhost:3128/
+	nice ./danbooru-update danbooru   || let EC=$EC+2
+	nice ./danbooru-update konachan   || let EC=$EC+2
+	nice ./danbooru-update moe.imouto || let EC=$EC+2
+	nice ./danbooru-quickupd danbooru   || let EC=$EC+16;
+	nice ./danbooru-quickupd konachan   || let EC=$EC+16;
+	nice ./danbooru-quickupd moe.imouto || let EC=$EC+16;
+
+	touch ~/doujin/danbooru/.lastquickupdate
+	exit $EC
+fi;
+
+nice ./danbooru-db danbooru   || let EC=$EC+16;
+nice ./danbooru-db konachan   || let EC=$EC+16;
+nice ./danbooru-db moe.imouto || let EC=$EC+16;
 
 SCREEN=imgSeekOne
 OTHER=imgSeekTwo
+screen -ls|grep imgSeek
 if screen -ls|grep $SCREEN &> /dev/null; then
 	SCREEN=imgSeekTwo
 	OTHER=imgSeekOne
@@ -35,9 +47,10 @@ echo Waiting for $PID to exit.
 COUNT=0
 while [ -n "$PID" -a -d /proc/$PID ]; do
 	let COUNT=$COUNT+1
-	if [ $COUNT -gt 20 ]; then echo "Waited too long, aborting."; exit 1; fi;
+	if [ $COUNT -gt 120 ]; then echo "Waited too long, aborting."; exit 1; fi;
 	sleep 2;
 done;
+echo Waited $COUNT*2 seconds.
 COUNT=0
 while ! echo  -e "ping me\ndone now\n"|nc localhost 5566; do
 	let COUNT=$COUNT+1

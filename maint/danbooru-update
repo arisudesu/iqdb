@@ -4,8 +4,8 @@ use warnings;
 use strict;
 
 use URI::Escape;
-use JSON::DWIW;
 
+#system("renice 15 $$");
 my $tag = shift or die "Give server tag on command line.\n";
 my $max = 0+(shift||0);
 my $cnt = 0;
@@ -22,10 +22,13 @@ $last_post = 0 + $last_post;
 print "Last post read: $last_post\n";
 
 open my $fres, ">>", "/usr/src/packages/sim/$tag.res" or die "Can't write $tag.cmd: $!\n";
+open my $fupd, ">>", "/usr/src/packages/sim/$tag.upd" or die "Can't write $tag.cmd: $!\n";
 
 my $ua = MyUserAgent->new;
 $ua->timeout(10);
 $ua->env_proxy;
+$ua->default_header("Accept-Encoding" => "gzip, deflate");
+$ua->agent("iqdb/0.1 (+http://iqdb.yi.org/)");
 
 #$response = file("http://$host/post/index.$ext?limit=50&login=$user&password_hash=$pw&tags=id%3A172410..172420");
 my @commands;
@@ -46,14 +49,17 @@ my $response = $ua->get_json("http://$host/post/index.$ext?limit=100&login=$user
 last unless @$response;
 for (@$response) {
 	$last_del = $_->{id};
-	$_->{md5} =~ /^(.)(.)(.)/;
-	my $fn = "$1/$2/$3/$_->{md5}.jpg";
-	$fn = glob "xx/*-$_->{md5}.jpg" unless -e $fn;
+	my $md5 = $_->{md5};
+	die "Invalid md5: $md5\n" unless length $md5 == 32;
+	$md5 =~ /^(.)(.)(.)/;
+	my $fn = "$1/$2/$3/$md5.jpg";
+	$fn = glob "xx/*-$md5.jpg" unless -e $fn;
 	#print "Already gone!\n" and
 	next unless $fn and -e $fn;
-	print "Deleting  $_->{id} = $_->{md5}.\n";
+	print "Deleting  $_->{id} = $md5.\n";
 	my $target = "todelete/".substr $fn, 1+rindex $fn,"/";
 	rename $fn,$target  or die "Can't rename $fn to $target: $!\n";
+	print $fupd "remove $_->{md5}\n";
 }
 }
 while(!$max or $cnt < $max) {
@@ -77,9 +83,10 @@ for (@$response) {
 		next;
 	}
 
-	if ($_->{width} && $_->{height}) {
-		print $fres "$md5 $_->{width} $_->{height}\n";
-	}
+	$_->{width} ||= 0;
+	$_->{height} ||= 0;
+	print $fres "$md5 $_->{width} $_->{height}\n";
+	print $fupd "add $md5 $_->{width} $_->{height}\n";
 
 	my ($file,$suf) = ($md5, substr $url, rindex $url, ".");
 	$file =~ /^(.)(.)(.)/;
@@ -92,28 +99,37 @@ for (@$response) {
 	my $tmpfile = "new/$md5$suf";
 
 	my $res = $ua->mirror($url, $tmpfile);
-	if ($res->code == 403) {
-		print "Skipped (403)\n";
-		print STDERR "$url ($id): ".$res->status_line."\n";
-		$warn++;
-		next;
+	if ($res->code == 500) {
+		print "Failed (".$res->status_line.")! Trying again. ";
+		$res = $ua->mirror($url, $tmpfile);
 	}
-	if ($res->code == 404) {
-		print "Skipped (404)\n";
-		print STDERR "$url ($id): ".$res->status_line."\n";
-		$warn++;
-		next;
-	}
+	#if ($res->code == 403) {
+	#	print "Skipped (403)\n";
+	#	print STDERR "$url ($id): ".$res->status_line."\n";
+	#	$warn++;
+	#	next;
+	#}
+	#if ($res->code == 404) {
+	#	print "Skipped (404)\n";
+	#	print STDERR "$url ($id): ".$res->status_line."\n";
+	#	$warn++;
+	#	next;
+	#}
 	if ($res->code >= 500) {
 		print "Failed (".$res->status_line.")! Aborting.\n";
 		die "$url ($id): ".$res->status_line."\n";
 	}
-	if (!is_success $res) {
+	if (!is_success $res and $res->code != 304) {
 		print "FAILED\n";
 		print STDERR "$url: ".$res->status_line."\n";
 		$err = 1;
 		next;
 	}
+	open my $f, "<", $tmpfile or die "Can't read $tmpfile: $!\n";
+	sysread $f, my $fhdr, 10 or die "Can't read $tmpfile: $!\n";
+	use bytes;
+	my $jpeghdr = "\xFF\xD8\xFF\xE0\x00\x10\x4A\x46\x49\x46";
+	$fhdr eq $jpeghdr or die "No JPEG header:\nGot= $fhdr\nWant=$jpeghdr\n";
 	rename $tmpfile, $file or die "Can't move $tmpfile to $file: $!\n";
 	print "OK ", -s $file, "\n";
 }
@@ -129,7 +145,7 @@ die "Had $warn warnings.\n" if $warn > 4;
 warn "Had $warn warnings.\n" if $warn;
 
 package MyUserAgent;
-use base qw(LWP::UserAgent);
+use base qw(LWP::UserAgent JSON::DWIW);
 sub prepare_request {
 	my $self = shift;
 	my $req = $self->SUPER::prepare_request(shift);
@@ -139,32 +155,41 @@ sub prepare_request {
 sub get_json {
 	my ($self,$url) = @_;
 	my $res = $self->get($url);
+	if ($res->status_line eq '500 read timeout') {
+		print STDERR $res->status_line, ", trying again.\n";
+		$res = $self->get($url);
+	}
 	die "Could not get json response: ".$res->status_line.".\nURL was: $url\n" unless $res->is_success;
 	#open my $json, ">", "last.js" or die; print $json $res->content; close $json;
 
-	$res = $res->content;
+	my $decoded = $res->decoded_content();
+	die "Could not decode content: $@\nURL was: $url\nUndecoded length is ".length $res->content,"\n" unless $decoded;
+	die "Invalid json data: ".substr($decoded,0,120)."\nURL was: $url\n" unless $decoded =~ /^\S*[[{]/;
 	#while ($res =~ s/(\\['"])//g) {
 	#	warn "Escaped quote: $1. Removed.\n";
 	#	#$warn++;
 	#}
 	#open my $json, ">", "last.jsf" or die; print $json $res; close $json;
 	#print STDERR "Parsing...";
-	#my $data = JSON::DWIW::deserialize $res;
+	my $out = JSON::DWIW::deserialize $decoded;
 	#print STDERR "done.\n";
-	my $data = $res;
+=com
+	my $data = $decoded;
 	$data =~ s/(["']\s*):/$1=>/g;
 	$data =~ s/\bnull\b/undef/g;
 	$data =~ s/\btrue\b/1/g;
 	$data =~ s/\bfalse\b/0/g;
 	$data =~ s/([\$\@])/\\$1/g;
 	my $out = eval $data;
+=cut
 	return $out if defined $out;
 	chdir "/usr/src/packages/sim";
 	open my $dump, ">", "last.json";
-	print $dump $res;
+	print $dump $decoded;
 	close $dump;
-	open $dump, ">", "last.jsonp";
-	print $dump $data;
-	close $dump;
-	die "JSON parsing failed: $@\n";
+	#open $dump, ">", "last.jsonp";
+	#print $dump $data;
+	#close $dump;
+	die "JSON parsing failed: $_\n" for get_error_string();
+	#die "JSON parsing failed: $@\n";
 }

@@ -1,3 +1,5 @@
-- make cache files optional?
+- queue mode_alter writes, don't touch file until ::save is called, then do it all at once
+- switch backend to GD from ImageMagick
 - instead of not ignoring MD5, change to always change MD5+tag like now, no need to check ignbase
 - fix dupe finder
+- option to query image resolution (and other info?) for querying *booru thumbs that are (probably) in the DB

@@ -7,6 +7,7 @@ see the file COPYING for details.
 1) Compiling
 
 - install the ImageMagick development package
+  (on Debian: libmagick9-dev)
 - run make
 - if it fails, fix the Makefile or something
 
@@ -48,14 +49,20 @@ the first argument being dbid=0. Commands of particular interest are:
 	remove <dbid> <imgid>
 		Remove the given image from the DB.
 	rehash <dbid>
-		Re-hash the given database after removing images, before
-		saving or querying it will work again.
-	saveas <dbid> <filename>
-		Save modified database in given file.
+		Do not use this command, it is no longer useful.
+		(As a special exception, `iqdb rehash foo.db' can
+		be used to upgrade an old version of the DB.)
 	done now
-		Quit without saving.
+		Quit and save all databases to their original file.
 	quit now
 		Quit and save all databases to their original file.
+
+Changes are automatically saved in the original file upon EOF on stdin,
+or when sending the "done now" or "quit now" commands.
+
+DO NOT interrupt the program with Ctrl-C or similar until the database
+is closed or it may become corrupted.
+
 
 b) Server mode
 
@@ -90,6 +97,11 @@ Of particular interest are the following commands:
 		individual scores to deal with varying similarity noise levels
 		in different databases (the noise level depends on the number
 		of images in the DB and how self-similar they are).
+
+The "add" and "remove" commands are now supported as well, however they
+only modify the memory representation of the DB and cannot be saved back
+to disk later. They allow you to update the server without restarting it
+but require that you also update the DB file directly.
 
 The server has the following possible responses:
 

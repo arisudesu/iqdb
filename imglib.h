@@ -32,6 +32,9 @@ queries. The read-only version can optionally discard image data not needed
 for querying from external image files to further reduce memory usage. This
 is called "simple mode".
 
+There is an additional "alter" version that modifies the DB file directly
+instead of first loading it into memory, like the other modes do.
+
 The advantage of this design is maximum code re-use for the two DB usage
 patterns: maintenance and querying. Both implementation classes use
 different variables, and specifically different iterators to iterate over
@@ -43,6 +46,7 @@ different but the majority of the actual code is the same for both types.
 #define IMGDBLIB_H
 
 #include <list>
+#include <tr1/unordered_map>
 
 #include "auto_clean.h"
 #include "haar.h"
@@ -75,6 +79,8 @@ union image_id_index {
 	imageId id;
 	size_t index;
 	image_id_index(imageId i) : id(i) { }
+	image_id_index(size_t ind, bool) : index(ind) { }
+	image_id_index() { }
 	bool operator==(const image_id_index& other) const { return id == other.id; }
 	bool operator!=(const image_id_index& other) const { return id != other.id; }
 };
@@ -135,8 +141,37 @@ typedef AutoClean<ImageInfoPtr, &ImageInfoPtr::destroy> AutoImageInfo;
 
 typedef std::pair<off_t, size_t> imageIdPage;
 
+template<bool is_simple, bool is_memory> class imageIdIndex_list;
+
+typedef std::vector<image_id_index> IdIndex_list;
+
+template<>
+class imageIdIndex_list<true, true> {
+public:
+	static const size_t threshold = 0;
+
+	imageIdIndex_map map_all(bool writable) { return writable ? imageIdIndex_map(NULL, &m_tail.front(), m_tail.size(), 0) : imageIdIndex_map(NULL, &m_base.front(), m_base.size(), 0); };
+	bool empty() { return m_tail.empty() && m_base.empty(); }
+	size_t size() { return m_tail.size() + m_base.size(); }
+	void reserve(size_t num) { if (num > m_base.size()) m_tail.reserve(num - m_base.size()); }
+	void resize(size_t num) { if (num <= size()) return; m_tail.resize(num - m_base.size()); }
+	void loaded(size_t num) { if (num > m_tail.size()) throw data_error("Loaded too many."); m_tail.resize(num); }
+	void set_base() { if (m_base.empty()) m_base.swap(m_tail); }
+	void push_back(image_id_index i) { m_tail.push_back(i); }
+	void remove(image_id_index i); // unimplemented.
+
+	const IdIndex_list& tail() { return m_tail; }
+
+	static int fd() { return -1; }
+
+protected:
+	IdIndex_list m_tail;
+	IdIndex_list m_base;
+};
+
+template<>
 template<bool is_simple>
-class imageIdIndex_list {
+class imageIdIndex_list<is_simple, false> {
 public:
 	static const size_t threshold = 128;
 
@@ -145,21 +180,22 @@ public:
 	imageIdIndex_map map_all(bool writable);
 	bool empty() { return !m_size && m_tail.empty(); }
 	size_t size() { return m_size + m_tail.size(); }
-	size_t paged_capacity() { return m_capacity; }
-	size_t paged_size() { return m_size; }
-	size_t tail_size() { return m_tail.size(); }
-	void reserve(size_t num);
+	void reserve(size_t num) { resize(num); }
+	void resize(size_t num);
 	void loaded(size_t num) { if (num > m_capacity) throw data_error("Loaded too many."); m_size = num; }
-	void push_back(image_id_index i) { m_tail.push_back(i); if (m_tail.size() >= threshold) page_out(); }
+	void set_base() { }
+	void push_back(image_id_index i) { m_tail.push_back(i); if (m_tail.size() >= threshold && can_page_out()) page_out(); }
 	void remove(image_id_index i);
-	void clear();
+	void clear() { m_tail.clear(); m_size = 0; }
+
+	const IdIndex_list& tail() { return m_tail; }
 
 	static int fd() { return m_fd; }
 
 protected:
 	typedef std::vector<imageIdPage> page_list;
-	typedef std::vector<image_id_index> image_list;
 
+	bool can_page_out() { return !is_simple || m_size < m_capacity; }
 	void page_out();
 
 	static int m_fd;
@@ -168,10 +204,9 @@ protected:
 	size_t m_size;
 	size_t m_capacity;
 	size_t m_baseofs;
-	image_list m_tail;
+	IdIndex_list m_tail;
 };
 
-class SigStruct;
 class bloom_filter;
 
 /* in memory signature structure */
@@ -197,7 +232,7 @@ public:
 			avgl[c] = lrint(ScoreMax * avglf[c]);
 	};
 
-	void init(ImgData* nsig) {
+	void init(const ImgData* nsig) {
 		id = nsig->id;
 		height = nsig->height;
 		width = nsig->width;
@@ -222,15 +257,6 @@ public:
 // typedefs
 //typedef std::map<const int, imageId> kwdFreqMap;
 
-/* Meta data structure */
-struct srzMetaDataStruct {
-	unsigned int isValidMetadata;
-	unsigned int iskVersion;
-	unsigned int bindingLang;
-	unsigned int isTrial;
-	unsigned int compilePlat;
-};
-
 template<bool is_simple>
 class dbSpaceImpl;
 
@@ -239,14 +265,14 @@ inline Score get_aspect(int width, int height) { return 0; }
 template<bool is_simple> class sigMap;
 
 template<>
-class sigMap<false> : public std::map<imageId, SigStruct*> {
+class sigMap<false> : public std::tr1::unordered_map<imageId, SigStruct*> {
 public:
 	void add_sig(imageId id, SigStruct* sig) { (*this)[id] = sig; }
 	void add_index(imageId id, size_t index) { throw usage_error("Only valid in read-only mode."); }
 };
 
 template<>
-class sigMap<true> : public std::map<imageId, size_t> {
+class sigMap<true> : public std::tr1::unordered_map<imageId, size_t> {
 public:
 	void add_sig(imageId id, SigStruct* sig) { throw usage_error("Not valid in read-only mode."); }
 	void add_index(imageId id, size_t index) { (*this)[id] = index; }
@@ -295,13 +321,15 @@ struct index_iterator<true> : public image_info_list::iterator {
 };
 
 // Iterate over a bucket of imageIdIndex values.
-template<bool is_simple>
+template<bool is_simple, typename B>
 struct id_index_iterator;
 
 // In normal mode, the imageIdIndex_map stores image IDs. Get the index from the dbSpace's linked SigStruct.
 template<>
-struct id_index_iterator<false> : public imageIdIndex_map::iterator {
-	id_index_iterator(const imageIdIndex_map::iterator& itr, dbSpaceImpl<false>& db) : imageIdIndex_map::iterator(itr), m_db(db) { }
+template<typename B>
+struct id_index_iterator<false,B> : public B {
+	typedef B base_type;
+	id_index_iterator(const base_type& itr, dbSpaceImpl<false>& db) : base_type(itr), m_db(db) { }
 	size_t index() const;	// Implemented below.
 
 	dbSpaceImpl<false>& m_db;
@@ -309,27 +337,101 @@ struct id_index_iterator<false> : public imageIdIndex_map::iterator {
 
 // In read-only/simple mode, the imageIdIndex_map stores the index directly.
 template<>
-struct id_index_iterator<true> : public imageIdIndex_map::iterator {
-	id_index_iterator(const imageIdIndex_map::iterator& itr, dbSpaceImpl<true>& db) : imageIdIndex_map::iterator(itr) { }
+template<typename B>
+struct id_index_iterator<true,B> : public B {
+	typedef B base_type;
+	id_index_iterator(const base_type& itr, dbSpaceImpl<true>& db) : base_type(itr) { }
 	size_t index() const { return (*this)->index; };
 };
 
-// DB space implementation.
+// Simplify reading/writing stream data.
+#define READER_WRAPPERS \
+	template<typename T> \
+	T read() { T dummy; base_type::read((char*) &dummy, sizeof(T)); return dummy; } \
+	\
+	template<typename T> \
+	void read(T* t) { base_type::read((char*) t, sizeof(T)); } \
+	\
+	template<typename T> \
+	void read(T* t, size_t n) { base_type::read((char*) t, sizeof(T) * n); }
+#define WRITER_WRAPPERS \
+	template<typename T> \
+	void write(const T& t) { base_type::write((char*) &t, sizeof(T)); } \
+	\
+	template<typename T> \
+	void write(const T* t, size_t n) { base_type::write((char*) t, sizeof(T) * n); }
+
+class db_ifstream : public std::ifstream {
+public:
+	typedef std::ifstream base_type;
+	db_ifstream(const char* fname) : base_type(fname, std::ios::binary) { }
+	READER_WRAPPERS
+};
+
+class db_ofstream : public std::ofstream {
+public:
+	typedef std::ofstream base_type;
+	db_ofstream(const char* fname) : base_type(fname, std::ios::binary) { };
+	WRITER_WRAPPERS
+};
+
+class db_fstream : public std::fstream {
+public:
+	typedef std::fstream base_type;
+	db_fstream(const char* fname) : base_type(fname, std::ios::binary | std::ios::in | std::ios::out) { };
+	READER_WRAPPERS
+	WRITER_WRAPPERS
+};
+
+// DB space implementations.
+
+// Common function used by all implementations.
+class dbSpaceCommon : public dbSpace {
+public:
+	virtual void addImage(imageId id, const char* filename);
+	virtual void addImageBlob(imageId id, const void *blob, size_t length);
+
+	static void imgDataFromFile(const char* filename, ImgData* img);
+
+	static bool is_grayscale(const lumin_int& avgl);
+
+protected:
+	static void sigFromImage(Image* image, imageId id, ImgData* sig);
+	static Image* imageFromFile(const char* filename);
+
+	template<typename B>
+	class bucket_set {
+	public:
+		typedef B colbucket[2][16384];
+		colbucket buckets[3];
+
+		colbucket& operator[] (size_t ind) { return buckets[ind]; }
+
+		B& at(int col, int coef, int* idxret = NULL);
+		void add(const ImgData* img, size_t index);
+		void remove(const ImgData* img);
+	};
+
+	static const size_t numbuckets = 3 * 2 * 16384;
+
+private:
+	void operator = (const dbSpaceCommon&);
+};
+
+// Specific implementations.
 template<bool is_simple>
-class dbSpaceImpl : public dbSpace {
+class dbSpaceImpl : public dbSpaceCommon {
 public:
 	dbSpaceImpl(bool with_struct);
 	virtual ~dbSpaceImpl();
 
-	virtual void load_stream(std::ifstream& f, srzMetaDataStruct& md);
-	virtual void save_stream(std::ofstream& f);
-	virtual int save_file(const char* filename);
+	virtual void save_file(const char* filename);
 
 	// Image queries.
-	virtual sim_vector queryImgID(imageId id, unsigned int numres);
-	virtual sim_vector queryImgIDFast(imageId id, unsigned int numres);
-	virtual sim_vector queryImgIDFiltered(imageId id, unsigned int numres, bloom_filter* bf);
-	virtual sim_vector queryImgRandom(unsigned int numres);
+	virtual sim_vector queryImgID(imageId id, unsigned int numres, int flags);
+	virtual sim_vector queryImgIDFast(imageId id, unsigned int numres, int flags);
+	virtual sim_vector queryImgIDFiltered(imageId id, unsigned int numres, int flags, bloom_filter* bf);
+	virtual sim_vector queryImgRandom(unsigned int numres, int flags);
 	virtual sim_vector queryImgData(const ImgData& img, unsigned int numres, int flags);
 	virtual sim_vector queryImgDataFast(const ImgData& img, unsigned int numres, int flags);
 	virtual sim_vector queryImgFile(const char* filename, unsigned int numres, int flags);
@@ -345,8 +447,7 @@ public:
 	virtual image_info_list getImgInfoList();
 
 	// DB maintenance.
-	virtual int addImage(imageId id, const char* filename);
-	virtual int addImageBlob(imageId id, const void *blob, size_t length);
+	virtual void addImageData(const ImgData* img);
 	virtual void setImageRes(imageId id, int width, int height);
 
 	virtual void removeImage(imageId id);
@@ -363,26 +464,28 @@ protected:
 	typedef sigMap<is_simple> image_map;
 	typedef typename image_map::iterator map_iterator;
 
-	typedef id_index_iterator<is_simple> idIndexIterator;
+	typedef id_index_iterator<is_simple, imageIdIndex_map::iterator> idIndexIterator;
+	typedef id_index_iterator<is_simple, IdIndex_list::const_iterator> idIndexTailIterator;
 
 	friend struct index_iterator<is_simple>;
-	friend struct id_index_iterator<is_simple>;
+	friend struct id_index_iterator<is_simple, imageIdIndex_map::iterator>;
+	friend struct id_index_iterator<is_simple, IdIndex_list::const_iterator>;
 
 	image_info_list& info() { return m_info; }
 	imageIterator find(imageId i);
 
-private:
-	void operator = (const dbSpaceImpl&);
+	virtual void load(const char* filename);
+	virtual void load_stream_old(db_ifstream& f, uint version);
 
+private:
 	imageIterator image_begin();
 	imageIterator image_end();
 
-	void addSigToBuckets(ImgData* nsig);
-	int addImageFromImage(imageId id, Image* image);
+	void addSigToBuckets(const ImgData* nsig);
 
 	size_t get_sig_cache();
 	ImgData get_sig_from_cache(imageId i);
-	void write_sig_cache(size_t ofs, ImgData* sig);
+	void write_sig_cache(size_t ofs, const ImgData* sig);
 	void read_sig_cache(size_t ofs, ImgData* sig);
 
 	template<int num_colors>
@@ -395,6 +498,7 @@ private:
 	int m_sigFile;
 	size_t m_cacheOfs;
 
+protected:
 	image_map m_images;
 
 	size_t m_nextIndex;
@@ -403,27 +507,102 @@ private:
 	/* Lists of picture ids, indexed by [color-channel][sign][position], i.e.,
 	   R=0/G=1/B=2, pos=0/neg=1, (i*NUM_PIXELS+j)
 	 */
-	imageIdIndex_list<is_simple> imgbuckets[3][2][16384];
+
+#ifdef USE_DISK_CACHE
+	static const bool is_memory = false;
+#else
+	static const bool is_memory = is_simple;
+#endif
+
+	struct bucket_type : public imageIdIndex_list<is_simple, is_memory> {
+		typedef imageIdIndex_list<is_simple, is_memory> base_type;
+		void add(image_id_index id, size_t index) { base_type::push_back(is_simple ? image_id_index(index, true) : image_id_index(id)); }
+		void remove(image_id_index id) { base_type::remove(id); }
+	};
+	bucket_set<bucket_type> imgbuckets;
 	bool m_bucketsValid;
+};
+
+// Directly modify DB file on disk.
+class dbSpaceAlter : public dbSpaceCommon {
+public:
+	dbSpaceAlter();
+	virtual ~dbSpaceAlter();
+
+	// Warning: filename is disregarded, it ALWAYS saves to the currently open file ONLY.
+	virtual void save_file(const char* filename);
+
+	// Image queries not supported.
+	virtual sim_vector queryImgID(imageId id, unsigned int numres, int flags) { throw usage_error("Not supported in alter mode."); }
+	virtual sim_vector queryImgIDFast(imageId id, unsigned int numres, int flags) { throw usage_error("Not supported in alter mode."); }
+	virtual sim_vector queryImgIDFiltered(imageId id, unsigned int numres, int flags, bloom_filter* bf) { throw usage_error("Not supported in alter mode."); }
+	virtual sim_vector queryImgRandom(unsigned int numres, int flags) { throw usage_error("Not supported in alter mode."); }
+	virtual sim_vector queryImgData(const ImgData& img, unsigned int numres, int flags) { throw usage_error("Not supported in alter mode."); }
+	virtual sim_vector queryImgDataFast(const ImgData& img, unsigned int numres, int flags) { throw usage_error("Not supported in alter mode."); }
+	virtual sim_vector queryImgFile(const char* filename, unsigned int numres, int flags) { throw usage_error("Not supported in alter mode."); }
+
+	// Stats. Partially unsupported (* could easily be supported by reading from disk but isn't needed).
+	virtual size_t getImgCount();
+	virtual stats_t getCoeffStats() { throw usage_error("Not supported in alter mode."); }
+	virtual bool hasImage(imageId id);
+	virtual int getImageHeight(imageId id);
+	virtual int getImageWidth(imageId id);
+	virtual bool isImageGrayscale(imageId id) { throw usage_error("Not supported in alter mode."); } // *
+	virtual imageId_list getImgIdList();
+	virtual image_info_list getImgInfoList() { throw usage_error("Not supported in alter mode."); }
+
+	// DB maintenance.
+	virtual void addImageData(const ImgData* img);
+	virtual void setImageRes(imageId id, int width, int height);
+
+	virtual void removeImage(imageId id);
+	virtual void rehash() { }
+
+	// Similarity.
+	virtual Score calcAvglDiff(imageId id1, imageId id2) { throw usage_error("Not supported in alter mode."); } // *
+	virtual Score calcSim(imageId id1, imageId id2, bool ignore_color = false) { throw usage_error("Not supported in alter mode."); } // *
+	virtual Score calcDiff(imageId id1, imageId id2, bool ignore_color = false) { throw usage_error("Not supported in alter mode."); } // *
+	virtual const lumin_int& getImageAvgl(imageId id) { throw usage_error("Not supported in alter mode."); } // *
+
+protected:
+	typedef std::tr1::unordered_map<imageId, size_t> ImageMap;
+
+	ImageMap::iterator find(imageId i);
+	ImgData get_sig(size_t ind);
+
+	virtual void load(const char* filename);
+
+private:
+	void operator = (const dbSpaceAlter&);
+
+	void resize_header();
+	void move_deleted();
+
+	struct bucket_type {
+		void add(image_id_index id, size_t index) { size++; }
+		void remove(image_id_index id) { size--; }
+
+		size_t size;
+	};
+
+	typedef std::vector<size_t> DeletedList;
+
+	ImageMap m_images;
+	db_fstream* m_f;
+	off_t m_hdrOff, m_sigOff, m_imgOff;
+	bucket_set<bucket_type> m_buckets;
+	DeletedList m_deleted;
+	bool m_rewriteIDs;
 };
 
 /* signature structure */
 static const unsigned int AVG_IMGS_PER_DBSPACE = 20000;
 
 // Serialization constants
-
-static const unsigned int	SRZ_VERSIONED			= 1;
 static const unsigned int	SRZ_V0_5_1			= 1;
 static const unsigned int	SRZ_V0_6_0			= 2;
 static const unsigned int	SRZ_V0_6_1			= 3;
-static const unsigned int	SRZ_SINGLE_DBSPACE		= 1;
-static const unsigned int	SRZ_MULTIPLE_DBSPACE		= 2;
-static const unsigned int	SRZ_TRIAL_VERSION		= 1;
-static const unsigned int	SRZ_FULL_VERSION		= 2;
-static const unsigned int	SRZ_PLAT_WINDOWS		= 1;
-static const unsigned int	SRZ_PLAT_LINUX			= 2;
-static const unsigned int	SRZ_LANG_PYTHON			= 1;
-static const unsigned int	SRZ_LANG_JAVA			= 2;
+static const unsigned int	SRZ_V0_7_0			= 8;
 
 /* keyword postings structure */
 static const unsigned int	 AVG_IMGS_PER_KWD	= 1000;
@@ -471,7 +650,7 @@ bloom_filter* getIdsBloomFilter(const int dbId);
 index_iterator<true>::index_iterator(const sigMap<true>::iterator& itr, dbSpaceImpl<true>& db)
   : base_type(db.info().begin() + itr->second), m_db(db) { }
 size_t index_iterator<true>::index() const { return *this - m_db.info().begin(); }
-size_t id_index_iterator<false>::index() const { return m_db.find((*this)->id).index(); }
+template<typename B> size_t id_index_iterator<false, B>::index() const { return m_db.find((*this)->id).index(); }
 
 } // namespace
 

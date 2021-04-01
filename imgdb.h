@@ -42,29 +42,33 @@ typedef int64_t DScore;
 // Exceptions.
 class generic_error : public std::exception {
 public:
-	generic_error(const char* what) throw() : m_what(what), m_type("generic_error") { }
-	virtual const char* what() const throw() { return m_what; }
-	virtual const char* type() const throw() { return m_type; }
+	~generic_error() throw() { if (m_str) { delete m_str; m_str = NULL; } }
+	const char* what() const throw() { return m_str ? m_str->c_str() : m_what; }
+	const char* type() const throw() { return m_type; }
 
 protected:
-	generic_error(const char* what, const char* type) throw() : m_what(what), m_type(type) { }
+	generic_error(const char* what, const char* type) throw() : m_what(what), m_type(type), m_str(NULL) { }
+	explicit generic_error(const std::string& what, const char* type) throw()
+		: m_what(NULL), m_type(type), m_str(new std::string(what)) { }
 private:
 	const char* m_what;
 	const char* m_type;
+	std::string* m_str;
 };
 
 #define DEFINE_ERROR(derived, base) \
 	class derived : public base { \
 	public: \
 		derived(const char* what) throw() : base(what, #derived) { } \
+		explicit derived(const std::string& what) throw() : base(what, #derived) { } \
 	protected: \
 		derived(const char* what, const char* type) throw() : base(what, type) { } \
+		explicit derived(const std::string& what, const char* type) throw() : base(what, type) { } \
 	};
 
 // Fatal, cannot recover, should discontinue using the dbSpace throwing it.
 DEFINE_ERROR(fatal_error,     generic_error)
 
-DEFINE_ERROR(usage_error,     fatal_error)	// Program was using library incorrectly.
 DEFINE_ERROR(io_error,        fatal_error)	// Non-recoverable IO error while read/writing database or cache.
 DEFINE_ERROR(data_error,      fatal_error)	// Database has internally inconsistent data.
 DEFINE_ERROR(memory_error,    fatal_error)	// Database could not allocate memory.
@@ -73,8 +77,13 @@ DEFINE_ERROR(internal_error,  fatal_error)	// The library code has a bug.
 // Non-fatal, may retry the call after correcting the problem, and continue using the library.
 DEFINE_ERROR(simple_error,    generic_error)
 
+DEFINE_ERROR(usage_error,     simple_error)	// Function call not available in current mode.
 DEFINE_ERROR(param_error,     simple_error)	// An argument was invalid, e.g. non-existent image ID.
 DEFINE_ERROR(image_error,     simple_error)	// Could not successfully extract image data from the given file.
+
+// specific param_error exceptions
+DEFINE_ERROR(duplicate_id,    param_error)	// Image ID already in DB.
+DEFINE_ERROR(invalid_id,      param_error)	// Image ID not found in DB.
 
 const Score ScoreScale = 20;
 const Score ScoreMax = (1 << ScoreScale);
@@ -82,10 +91,10 @@ const Score ScoreMax = (1 << ScoreScale);
 typedef signed int lumin_int[3];
 
 struct sim_value {
-	sim_value(imageId i, Score s, int w, int h) : id(i), score(s), width(w), height(h) { }
+	sim_value(imageId i, Score s, unsigned int w, unsigned int h) : id(i), score(s), width(w), height(h) { }
 	imageId id;
 	Score score;
-	int width, height;
+	unsigned int width, height;
 };
 
 struct image_info {
@@ -122,17 +131,15 @@ struct ImgData {
 class dbSpace;
 class bloom_filter;
 struct srzMetaDataStruct;
-
-class dbSpaceMap : public std::map<int, dbSpace*> {
-	static dbSpaceMap  load_file(const char* filename, int  mode);
-	int                save_file(const char* filename);
-};
+class db_ifstream;
+class db_ofstream;
 
 class dbSpace {
 public:
 	static const int mode_normal    = 0x00; // Full functionality, but slower queries.
-	static const int mode_readonly	= 0x01; // Fast queries, but no modifications.
-	static const int mode_simple	= 0x02; // Fast queries, less memory, no image ID queries.
+	static const int mode_readonly	= 0x01; // Fast queries, cannot save back to disk.
+	static const int mode_simple	= 0x02; // Fast queries, less memory, cannot save, no image ID queries.
+	static const int mode_alter	= 0x03;	// Fast add/remove/info on existing DB file, no queries.
 
 	// Image query flags.
 	static const int flag_sketch	= 0x01;	// Image is a sketch, use adjusted weights.
@@ -142,15 +149,15 @@ public:
 	static const int flag_nocommon	= 0x10;	// Disregard common coefficients (those which are present in at least 10% of the images).
 
 	static dbSpace*    load_file(const char* filename, int mode);
-	virtual int        save_file(const char* filename) = 0;
+	virtual void       save_file(const char* filename) = 0;
 
 	virtual ~dbSpace();
 
 	// Image queries.
-	virtual sim_vector queryImgID(imageId id, unsigned int numres) = 0;
-	virtual sim_vector queryImgIDFast(imageId id, unsigned int numres) = 0;
-	virtual sim_vector queryImgIDFiltered(imageId id, unsigned int numres, bloom_filter* bf) = 0;
-	virtual sim_vector queryImgRandom(unsigned int numres) = 0;
+	virtual sim_vector queryImgID(imageId id, unsigned int numres, int flags) = 0;
+	virtual sim_vector queryImgIDFast(imageId id, unsigned int numres, int flags) = 0;
+	virtual sim_vector queryImgIDFiltered(imageId id, unsigned int numres, int flags, bloom_filter* bf) = 0;
+	virtual sim_vector queryImgRandom(unsigned int numres, int flags) = 0;
 	virtual sim_vector queryImgData(const ImgData& img, unsigned int numres, int flags) = 0;
 	virtual sim_vector queryImgDataFast(const ImgData& img, unsigned int numres, int flags) = 0;
 	virtual sim_vector queryImgFile(const char* filename, unsigned int numres, int flags) = 0;
@@ -168,8 +175,9 @@ public:
 	virtual image_info_list getImgInfoList() = 0;
 
 	// DB maintenance.
-	virtual int addImage(imageId id, const char* filename) = 0;
-	virtual int addImageBlob(imageId id, const void *blob, size_t length) = 0;
+	virtual void addImage(imageId id, const char* filename) = 0;
+	virtual void addImageBlob(imageId id, const void *blob, size_t length) = 0;
+	virtual void addImageData(const ImgData* img) = 0;
 	virtual void setImageRes(imageId id, int width, int height) = 0;
 
 	virtual void removeImage(imageId id) = 0;
@@ -184,9 +192,7 @@ public:
 protected:
 	dbSpace();
 
-	friend class dbSpaceMap;
-	virtual void load_stream(std::ifstream& f, srzMetaDataStruct& md) = 0;
-	virtual void save_stream(std::ofstream& f) = 0;
+	virtual void load(const char* filename) = 0;
 
 private:
 	void operator = (const dbSpace&);

@@ -62,11 +62,32 @@ public:
 	T& operator* () { return *m_p; }
 	T* operator->() { return m_p; }
 
-	T* operator= (T* p) { set(p); return p; }
-
 private:
 	AutoCleanPtr(const AutoCleanPtr&);
 	AutoCleanPtr& operator = (const AutoCleanPtr&);
 
 	T* m_p;
 };
+
+template<typename T>
+class AutoCleanArray {
+public:
+	AutoCleanArray() : m_p(NULL) { }
+	AutoCleanArray(T* p) : m_p(p) { }
+	~AutoCleanArray() { delete[] m_p; m_p = NULL; }
+
+	void set(T* p) { delete[] m_p; m_p = p; }
+	T* ptr() { return m_p; }
+
+	T& operator[](size_t ind) { return m_p[ind]; }
+
+	T& operator* () { return *m_p; }
+	T* operator->() { return m_p; }
+
+private:
+	AutoCleanArray(const AutoCleanArray&);
+	AutoCleanArray& operator = (const AutoCleanArray&);
+
+	T* m_p;
+};
+

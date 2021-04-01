@@ -21,6 +21,20 @@ function error($text) {
 	echo '<error message="'.htmlentities($text).'" info=""></error>';
 	exit;
 }
+# for debugging problems
+function debug($txt) {
+	echo "<!-- $txt -->\n";
+}
+
+# sample processing function if the filenames aren't in the default danbooru style
+function my_process($arg) {
+	global $services;
+	# do something with the image ID in $arg["id"]
+	# also set these:
+	$arg["eng"] = "";	// this will go in the name="" field of the XML output
+	$arg["tag"] = $services[0];	// DB number, or anything that maps to the service name in $services
+	return $arg;
+}
 
 foreach (array_keys($services) as $srv)
 	if (is_array($services[$srv]))
@@ -33,6 +47,7 @@ if ($thumb['err']) error("Thumbnail error code ".$thumb['err']);
 
 $res = request_match($thumb["name"], $_POST["service"], array("forcegray" => $_POST["forcegray"]));
 if ($res['err']) error($res['err']);
+if ($res['fatal']) error("Fatal: ".$res['err']);
 
 $thres = process_match($res["match"]);
 if ($thres['err']) error($thres['err']);
