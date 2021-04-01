@@ -25,9 +25,8 @@
    typedef AutoClean<Foo, &Foo::clean> CleanFoo;
 
    Calls Foo::clean when the CleanFoo object goes out of scope.
-*/
 
-/* 2. Pointer version. Deletes pointee when going out of scope and trusts
+   2. Pointer version. Deletes pointee when going out of scope and trusts
       destructor to do the cleaning.
 
    Example:
@@ -35,6 +34,8 @@
 
    Also supports object.set(foo2) to delete the old pointer (if any) and use
    the new one (which may be NULL).
+
+   2b. Array version. Uses delete[] instead of delete.
 */
 
 template<typename T, void (T::*cleanup_func)()>

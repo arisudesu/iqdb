@@ -1,3 +1,7 @@
+iqdb-20080612:
+- optimized delta_iterator to improve query speed by ~20%
+  (now as fast or even slightly faster than before)
+
 iqdb-20080611:
 - greatly reduced memory usage (and only slightly increased query
   times) with USE_DELTA_QUEUE in the Makefile (enabled by default)

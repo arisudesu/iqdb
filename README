@@ -7,7 +7,7 @@ see the file COPYING for details.
 1) Compiling
 
 - install the ImageMagick development package
-  (on Debian: libmagick9-dev)
+  (on Debian: libmagick9-dev, on Fedora: ImageMagick-devel)
 - run make
 - if it fails, fix the Makefile or something
 
@@ -109,7 +109,7 @@ but require that you also update the DB file directly.
 The server has the following possible responses:
 
 	000 iqdb ready
-		Display whenever iqdb is ready to
+		Displayed whenever iqdb is ready to
 		accept a command.
 	100 <text>
 		General informational message.

@@ -26,25 +26,31 @@ union delta_value {
 	delta_value() { }
 	delta_value(size_t v) : full(v) { }
 
+	void put(unsigned char v, int pos) { full |= v << (8 * pos); }
+	unsigned char get() { unsigned char v = full; full >>= 8; return v; }
+
 	size_t full;
-	unsigned char sub[size_t_mask + 1];
 };
 
 struct delta_iterator : public std::iterator<std::forward_iterator_tag, size_t> {
-	delta_iterator(const delta_value* bitr) : m_itr(bitr), m_val(*bitr), m_bval(0), m_ind(0) { ++m_itr; }
-	delta_iterator(const delta_value* bitr, int ind) : m_itr(bitr), m_ind(ind) { }
+	delta_iterator(const delta_value* itr) : m_p(ptr(itr)), m_val(*itr), m_bval(0) { ++*this; }
+	delta_iterator(const delta_value* itr, int ind) : m_p(ptr(itr) + ind + 1 - sizeof(size_t)) { }	// only useful for end()
 	delta_iterator() { }
 
-	size_t operator*() const;
 	delta_iterator& operator++();
-	bool operator==(const delta_iterator& other) const { return m_itr == other.m_itr && m_ind == other.m_ind; }
-	bool operator!=(const delta_iterator& other) const { return m_itr != other.m_itr || m_ind != other.m_ind; }
+	size_t operator*() const { return m_bval; }
+	bool operator==(const delta_iterator& other) const { return m_p == other.m_p; }
+	bool operator!=(const delta_iterator& other) const { return m_p != other.m_p; }
 
 private:
-	const delta_value* m_itr;
+	size_t itr() const { return *(const size_t*)(m_p & ~size_t_mask); }
+	size_t ind() const { return m_p & size_t_mask; }
+
+	static size_t ptr(const delta_value* itr) { return (size_t)itr & size_t_mask ? 0 : (size_t)itr; }
+
+	size_t m_p;
 	delta_value m_val;
 	size_t m_bval;
-	int m_ind;
 };
 
 class delta_queue {
@@ -57,7 +63,7 @@ public:
 	typedef delta_iterator iterator;
 	typedef delta_iterator const_iterator;
 
-	delta_queue() : m_base(1, 0), m_size(0), m_pos(0), m_bval(0) { }
+	delta_queue() : m_base(1, 0), m_size(0), m_pos(0), m_bval(0) { if (sizeof(size_t) != sizeof(char*)) throw 42; }
 
 	const_iterator begin() const { return const_iterator(&*m_base.begin()); }
 	const_iterator end() const { return const_iterator(&*m_base.end(), m_size & mask); }
@@ -83,25 +89,19 @@ private:
 	size_t m_bval;
 };
 
-inline size_t delta_iterator::operator*() const {
-	unsigned char val = m_val.sub[m_ind];
-//fprintf(stderr, "Returning %zd+%d [ind=%d val=%08x full=%08x]. ", m_bval, val, m_ind, m_val.full, full);
-	return m_bval + (val == 255 ? m_itr->full : val);
-}
-
 inline delta_iterator& delta_iterator::operator++() {
-	unsigned char val = m_val.sub[m_ind];
-//fprintf(stderr, "Advancing, from base=%zd ind=%d val=%08x ", m_bval, m_ind, m_val.full);
-	m_bval += val == 255 ? m_itr++->full : val;
-	m_ind++;
+	size_t val = m_val.get();
+//fprintf(stderr, "Advancing, from base=%zd ind=%d val=%08x:%02x ", m_bval, ind(), m_val.full, val);
+	m_bval += val;
+	if (val == 255) {
+		m_p += sizeof(size_t);
+		m_bval += itr();
+	}
 
-	// Zero-branch advancing of base iterator.
-	// adv_mask is -1=0xffff.. if not reading a new set of value bytes, or 0 otherwise.
-	size_t adv_mask = (m_ind & ~size_t_mask) / (size_t_mask + 1) - 1;
-	m_ind &= size_t_mask;
-	m_val.full = adv_mask & m_val.full | ~adv_mask & m_itr->full;
-	m_itr += adv_mask + 1;
-//fprintf(stderr, "to base=%zd ind=%d val=%08x. ", m_bval, m_ind, m_val.full);
+	m_p++;
+	val = (ind() != 0) - 1;
+	m_val.full += val & itr();
+//fprintf(stderr, "to base=%zd ind=%d val=%08x. ", m_bval, ind(), m_val.full);
 	return *this;
 }
 
@@ -116,11 +116,13 @@ inline void delta_queue::push_back(size_t v) {
 	v -= m_bval;
 	m_bval += v;
 
-	if (v >= 255)
-		m_base.push_back(v);
+	if (v >= 255) {
+		m_base.push_back(v - 255);
+		v = 255;
+	}
 
 //fprintf(stderr, "Writing %zd at %zd/%zd. ", v, m_pos, m_size & mask);
-	m_base[m_pos].sub[m_size++ & mask] = v < 255 ? v : 255;
+	m_base[m_pos].put(v, m_size++ & mask);
 //fprintf(stderr, "Now size=%zd. ", m_size);
 
 	if (!(m_size & mask)) {

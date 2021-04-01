@@ -86,7 +86,7 @@ union image_id_index {
 	imageId id;
 	size_t index;
 	image_id_index(imageId i) : id(i) { }
-	explicit image_id_index(size_t ind) : index(ind) { }
+	image_id_index(size_t ind, bool) : index(ind) { }
 	image_id_index() { }
 	bool operator==(const image_id_index& other) const { return id == other.id; }
 	bool operator!=(const image_id_index& other) const { return id != other.id; }
@@ -543,7 +543,7 @@ public:
 	virtual Score calcDiff(imageId id1, imageId id2, bool ignore_color = false);
 	virtual const lumin_int& getImageAvgl(imageId id);
 
-protected:
+private:
 #ifdef USE_DISK_CACHE
 	static const bool is_memory = false;
 #else
@@ -569,7 +569,6 @@ protected:
 
 	bool skip_image(const imageIterator& itr, const queryArg& query);
 
-private:
 	imageIterator image_begin();
 	imageIterator image_end();
 
@@ -586,7 +585,6 @@ private:
 	int m_sigFile;
 	size_t m_cacheOfs;
 
-protected:
 	image_map m_images;
 
 	size_t m_nextIndex;
@@ -598,7 +596,7 @@ protected:
 
 	struct bucket_type : public imageIdIndex_list<is_simple, is_memory> {
 		typedef imageIdIndex_list<is_simple, is_memory> base_type;
-		void add(image_id_index id, size_t index) { base_type::push_back(is_simple ? image_id_index(index) : image_id_index(id)); }
+		void add(image_id_index id, size_t index) { base_type::push_back(is_simple ? image_id_index(index, true) : image_id_index(id)); }
 		void remove(image_id_index id) { base_type::remove(id); }
 	};
 	typedef bucket_set<bucket_type> buckets_t;

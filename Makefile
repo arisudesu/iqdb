@@ -31,12 +31,14 @@ all:	iqdb
 %.o : %.cpp
 iqdb.o : imgdb.h haar.h auto_clean.h
 imgdb.o : imgdb.h imglib.h haar.h auto_clean.h delta_queue.h
-test-db.o : imgdb.h
+test-db.o : imgdb.h delta_queue.h
 haar.o :
 %.le.o : %.h
 iqdb.le.o : imgdb.h haar.h auto_clean.h
 imgdb.le.o : imgdb.h imglib.h haar.h auto_clean.h delta_queue.h
 haar.le.o :
+
+.ALWAYS:
 
 % : %.o haar.o imgdb.o # bloom_filter.o
 	g++ -o $@ $^ ${CFLAGS} ${LDFLAGS} -g `pkg-config --libs ImageMagick` ${DEFS}
@@ -49,3 +51,7 @@ haar.le.o :
 
 %.le.o : %.cpp
 	g++ -c -o $@ $< -O2 -fpeel-loops ${CFLAGS} -DCONV_LE -DNDEBUG -Wall -DLinuxBuild -DImMagick -g `pkg-config --cflags ImageMagick` ${DEFS}
+
+%.S:	.ALWAYS
+	g++ -S -o $@ $*.cpp -O2 -fpeel-loops ${CFLAGS} -DNDEBUG -Wall -DLinuxBuild -DImMagick -g `pkg-config --cflags ImageMagick` ${DEFS}
+

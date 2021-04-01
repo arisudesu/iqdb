@@ -18,18 +18,20 @@ void DeltaTest::test() {
 	DeltaTest delta;
 	std::vector<size_t> comp;
 
-	printf("Testing delta queue... ");
+	printf("Testing delta queue...\nStoring");
 	size_t last = 0;
 	delta.reserve(100000);
 	for (int i = 0; i < 100000; i++) {
 		bool type = (rand() & 0xff) < 10;
 		size_t val = 1 + (rand() & (type ? 0xffff: 0xfd)) + (type * 254);
-		if ((val > 254) != type) { printf("%d %d\n", type, val); throw imgdb::internal_error("Bad value!"); }
+		if ((val > 254) != type) { printf("%d %zd\n", type, val); throw imgdb::internal_error("Bad value!"); }
 		last += val;
+		if (i < 10) printf(" %zu=%zd ", last, val);
 		delta.push_back(last);
 		comp.push_back(last);
 	}
-	printf("%zd values, %zd used in container (capacity %zd, %d%%/%d%%). Verifying... ", delta.size(), delta.m_base.size(), delta.m_base.capacity(), delta.m_base.capacity()*100/delta.size(), delta.m_base.size()*100/delta.size());
+	printf("\nFirst elements:"); for (int i = 0; i < 10; i++) printf(" %08zx", delta.m_base[i].full);
+	printf("\n%zd values, %zd used in container (capacity %zd, %zd%%/%zd%%). Verifying... ", delta.size(), delta.m_base.size(), delta.m_base.capacity(), delta.m_base.capacity()*100/delta.size(), delta.m_base.size()*100/delta.size());
 	iterator itr = delta.begin();
 	std::vector<size_t>::iterator cItr = comp.begin();
 	int i = 0;
@@ -145,6 +147,7 @@ int main() {
 	fprintf(stderr, "Adding 50-4+50 images... ");
 	for (int i = 1; i <= 50; i++) ADD(i);
 	DELETE(4); DELETE(27); DELETE(15); DELETE(48);
+	ADD(24); DELETE(4); DELETE(27);
 	for (int i = 51; i <= 100; i++) ADD(i);
 	check(db, 100, removed);
 	fprintf(stderr, "Saving. ");
