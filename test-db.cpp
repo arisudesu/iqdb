@@ -5,7 +5,10 @@
 
 #include <tr1/unordered_map>
 #include "delta_queue.h"
+#include "debug.h"
 #include "imgdb.h"
+
+int debug_level = DEBUG_errors | DEBUG_base | DEBUG_summary | DEBUG_resizer | DEBUG_image_info;
 
 static const char* fn = "test-db.idb";
 
@@ -13,6 +16,17 @@ class DeltaTest : public delta_queue {
 public:
 	static void test();
 };
+
+#define S std::string()+
+std::string operator +(const std::string& str, size_t v) {
+	std::string out;
+	out.reserve(str.length() + 20);
+	out.append(str);
+	char buf[20];
+	snprintf(buf, 20, "%zd", v);
+	out.append(buf);
+	return out;
+}
 
 void DeltaTest::test() {
 	DeltaTest delta;
@@ -22,9 +36,16 @@ void DeltaTest::test() {
 	size_t last = 0;
 	delta.reserve(100000);
 	for (int i = 0; i < 100000; i++) {
+		if (i < 300) {
+			int c = 0;
+			iterator itr;
+			for (itr = delta.begin(); itr != delta.end() && c < i; ++itr, ++c);
+			if (c != i) throw imgdb::internal_error(S"\nFailed! Reached end() at "+c+" not "+i+"!\n");
+			if (itr != delta.end()) throw imgdb::internal_error(S"\nFailed! Did not reach end() at "+c+"/"+i+"!\n");
+		}
 		bool type = (rand() & 0xff) < 10;
 		size_t val = 1 + (rand() & (type ? 0xffff: 0xfd)) + (type * 254);
-		if ((val > 254) != type) { printf("%d %zd\n", type, val); throw imgdb::internal_error("Bad value!"); }
+		if ((val > 254) != type) throw imgdb::internal_error(S"Bad value! type="+type+" val="+val+"\n");
 		last += val;
 		if (i < 10) printf(" %zu=%zd ", last, val);
 		delta.push_back(last);
@@ -36,13 +57,10 @@ void DeltaTest::test() {
 	std::vector<size_t>::iterator cItr = comp.begin();
 	int i = 0;
 	for (; itr != delta.end() && cItr != comp.end(); ++itr, ++cItr, ++i) {
-		if (*itr != *cItr) {
-			printf("\nFailed! Element %d is %zd but should be %zd!\n", i, *itr, *cItr);
-			exit(1);
-		}
+		if (*itr != *cItr) throw imgdb::internal_error(S"\nFailed! Element "+i+" is "+*itr+" but should be "+*cItr+"!\n");
 	}
-	if (itr != delta.end()) { printf("\nFailed! Did not reach end at element %d!\n", i); exit(1); }
-	if (cItr != comp.end()) { printf("\nFailed! Reached end prematurely at element %d!\n", i); exit(1); }
+	if (itr != delta.end()) throw imgdb::internal_error(S"\nFailed! Did not reach end at element "+i+"!\n");
+	if (cItr != comp.end()) throw imgdb::internal_error(S"\nFailed! Reached end prematurely at element "+i+"!\n");
 	printf("OK.\n");
 }
 
@@ -126,8 +144,9 @@ int main() {
 	DeltaTest::test();
 
 	deleted_t removed;
-	imgdb::dbSpace::imgDataFromFile("test.jpg", &org);
+	imgdb::dbSpace::imgDataFromFile("test.jpg", 0, &org);
 	fprintf(stderr, "test.jpg avgl: %f %f %f\n", org.avglf[0], org.avglf[1], org.avglf[2]);
+	if (!org.avglf[0] || !org.avglf[1] || !org.avglf[2]) { DEBUG(errors)("Image loading failed!\n"); exit(1); }
 	unlink(fn);
 	fprintf(stderr, "Creating new DB %s... ", fn);
 	imgdb::dbSpace* db = imgdb::dbSpace::load_file(fn, imgdb::dbSpace::mode_alter);

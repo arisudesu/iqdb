@@ -1,6 +1,11 @@
 <?php
 
+# The functions microtime_float, thumb_fname, make_thumb and request_srv may
+# be defined by your code before including this file, if you need to do their
+# work a little differently. Then you can still use the other functions here.
+
 # Connect to iqdb server, send it a command and parse the replies.
+if (!function_exists("request_srv")) {
 function request_srv($line) {
 	global $iqdb_host, $iqdb_port, $iqdb_restart_cmd;
 
@@ -23,9 +28,20 @@ function request_srv($line) {
 	#debug("Sending: $line\n");
 	fwrite($fp, "$line\n");
 	fflush($fp);
+
+	$response = "";
+	while (!feof($fp))
+		$response.=fread($fp, 16384);
+	fclose($fp);
+
+	return parse_response($response);
+}
+}
+
+function parse_response($lines) {
 	$res = array("info" => array(), "values" => array(), "results" => array());
 
-	while ($line = fgets($fp, 1024)) {
+	foreach (split("\n", $lines) as $line) {
 		#debug("got $line");
 		list($code,$rest) = split(" ", chop($line), 2);
 		#debug("code=$code rest=$rest");
@@ -47,15 +63,16 @@ function request_srv($line) {
 			default:  return array("fatal" => "Unsupported result code $code $rest");
 		}
 	}
-	fclose($fp);
 
 	return $res;
 }
 
 # For stats on how long the various search steps take.
+if (!function_exists("microtime_float")) {
 function microtime_float() {
 	list($usec, $sec) = explode(" ", microtime());
 	return ((float)$usec + (float)$sec);
+}
 }
 
 # Ask iqdb server for images most similar to given file.
@@ -96,6 +113,7 @@ function request_match($file, $querysrv, $options = array()) {
 	}
 	if ($res["fatal"]) return $res;
 	$time = microtime_float() - $start;
+	if ($res["values"]["time"]) $time += $res["values"]["time"];
 	$start = microtime_float();
 	$result = array("values" => $res["values"], "match" => array());
 
@@ -129,7 +147,7 @@ function request_match($file, $querysrv, $options = array()) {
 	}
 	$dbtime = microtime_float() - $start;
 	#debug("Got ".count($res["results"])." results parsed into ".count($result["match"])." matches.");
-	if (count($res["results"]) && !count($result["match"])) return array('err' => "Thumbnails not found.");
+	if (count($res["results"]) && !count($result["match"])) return array('err' => "Thumbnails not found or search returned no results.");
 	if (!count($result["match"])) return array('err' => "Database error: ".($res["err"]?$res["err"]:"No matches returned."));
 	$result["stats"] = sprintf("query %.3fs db %.3fs", $time, $dbtime);
 	return $result;
@@ -188,9 +206,26 @@ function resample_thumb($image, $fname, $fqual, $thu_x, $thu_y, $size_x, $size_y
 	return $res;
 }
 
+if (!function_exists("thumb_fname")) {
+function thumb_fname(&$thumb, $pref, $ext = ".jpg") {
+	global $thu_dir;
+	for ($count = 0; $count < 32; $count++) {
+		$seed = substr(md5($seed.microtime().posix_getpid()), 0, 8);
+		$thumb["seed"] = $seed;
+		$thumb["fname"] = "$pref$seed$ext";
+		$thumb["name"] = "$thu_dir/".$thumb["fname"];
+		@$fh = fopen($thumb["name"], "x");
+		#debug(array("thu $count: $thuname", $fh ? "success" : "failed"));
+		if ($fh) return $fh;
+	};
+	return false;
+}
+}
+
 # Save JPEG thumbnail of $org in $img. Return thumb info or error.
+if (!function_exists("make_thumb")) {
 function make_thumb($img, $org) {
-	global $thu_dir, $thudim, $maxdim, $largedim, $largehnd;
+	global $thudim, $maxdim, $largedim, $largehnd;
 
 	@$size = getimagesize($img);
 	if (!$size) 
@@ -217,17 +252,8 @@ function make_thumb($img, $org) {
 	if (!$image)
 		return array("err" => "NotImage", "errarg" => array(htmlentities($org)));
 
-	for ($count = 0; $count < 32; $count++) {
-		$seed = substr(md5($seed.microtime().posix_getpid()), 0, 8);
-		$thumb["seed"] = $seed;
-		$thumb["fname"] = "thu_$seed.jpg";
-		$thumb["name"] = "$thu_dir/".$thumb["fname"];
-		@$fh = fopen($thumb["name"], "x");
-		#debug(array("thu $count: $thuname", $fh ? "success" : "failed"));
-		if ($fh) break;
-	};
-	if (!$fh)
-		return array("err" => "ThumbErr");
+	$fh = thumb_fname($thumb, "thu_");
+	if (!$fh) return array("err" => "ThumbErr");
 	fclose($fh);
 
 	/* Create thumbnail in PHP */
@@ -264,6 +290,7 @@ function make_thumb($img, $org) {
 	if (!$res) return array("err" => "ThumbErr");
 	$thumb["stats"] = sprintf(" thu %.3fs", $end-$start);
 	return $thumb;
+}
 }
 
 # Output list of matches as XML.

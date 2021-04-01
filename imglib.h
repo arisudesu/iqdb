@@ -46,12 +46,17 @@ different but the majority of the actual code is the same for both types.
 #define IMGDBLIB_H
 
 #include <list>
-#include <tr1/unordered_map>
 
 #include <fstream>
 #include <iostream>
 
+#if LIB_GD
+#include "resizer.h"
+#elif LIB_ImageMagick
 #include <magick/api.h>
+#else
+#error Unsupported image library.
+#endif
 
 #include "auto_clean.h"
 #include "delta_queue.h"
@@ -137,38 +142,49 @@ template<> struct map_iterator<true> : public map_iterator<false> {
 };
 #endif
 
-template<bool is_simple>
-struct imageIdIndex_map {
-	typedef map_iterator<is_simple> iterator;
-	imageIdIndex_map() : m_base(NULL) { }
-	imageIdIndex_map(void* base, iterator img, iterator end, size_t l)
-		: m_base(base), m_img(img), m_end(end), m_length(l) { }
-	//image_id_index& operator[] (size_t ofs) { return m_img[ofs]; }
-	bool operator! () { return m_base; }
+struct mapped_file {
+	mapped_file() : m_base(NULL) { }
+	mapped_file(void* base, size_t len) : m_base(base), m_length(len) { }
+	mapped_file(const char* fname, bool writable);
+
 	void unmap();
-	iterator begin() { return m_img; }
-	iterator end() { return m_end; }
-	size_t size() { return m_end - m_img; }
 
 	void* m_base;
+	size_t m_length;
+};
+
+template<bool is_simple>
+struct imageIdIndex_map : public mapped_file {
+	typedef map_iterator<is_simple> iterator;
+	imageIdIndex_map() { }
+	imageIdIndex_map(void* base, iterator img, iterator end, size_t l)
+		: mapped_file(base, l), m_img(img), m_end(end) { }
+	//image_id_index& operator[] (size_t ofs) { return m_img[ofs]; }
+	//bool operator! () { return !m_base; }
+	iterator begin() { return m_img; }
+	iterator end() { return m_end; }
+	//size_t size() { return m_end - m_img; }
+
 	iterator m_img;
 	iterator m_end;
-	size_t m_length;
 };
 
 // Automatically unmaps the imageIdIndex_map when it goes out of scope.
 template<bool is_simple>
-struct AutoImageIdIndex_map : public AutoClean<imageIdIndex_map<is_simple>, &imageIdIndex_map<is_simple>::unmap> {
-	typedef AutoClean<imageIdIndex_map<is_simple>, &imageIdIndex_map<is_simple>::unmap> base_type;
+struct AutoImageIdIndex_map : public imageIdIndex_map<is_simple> {
+	typedef imageIdIndex_map<is_simple> base_type;
 	AutoImageIdIndex_map(const imageIdIndex_map<is_simple>& map) : base_type(map) { }
+	~AutoImageIdIndex_map() { base_type::unmap(); }
 };
 
+#if LIB_ImageMagick
 // Clean up Image when it goes out of scope.
 struct ImagePtr {
 	ImagePtr(Image* i) : m_image(i) { }
 	void destroy() { if (m_image) DestroyImage(m_image); m_image=NULL; }
 	bool operator! () { return !m_image; }
-	Image* operator& () { return m_image; }
+	operator Image* () { return m_image; }
+	operator const Image* () const { return m_image; }
 	Image* m_image;
 };
 typedef AutoClean<ImagePtr, &ImagePtr::destroy> AutoImage;
@@ -182,10 +198,16 @@ struct ImageInfoPtr {
 	ImageInfoPtr() : m_info(CloneImageInfo(NULL)) { }
 	void destroy() { DestroyImageInfo(m_info); }
 	ImageInfo* operator->() { return m_info; }
-	ImageInfo* operator& () { return m_info; }
+	operator ImageInfo* () { return m_info; }
+	operator const ImageInfo* () const { return m_info; }
 	ImageInfo* m_info;
 };
 typedef AutoClean<ImageInfoPtr, &ImageInfoPtr::destroy> AutoImageInfo;
+#endif
+
+#if LIB_GD
+typedef gdImage Image;
+#endif
 
 typedef std::pair<off_t, size_t> imageIdPage;
 
@@ -333,14 +355,14 @@ inline Score get_aspect(int width, int height) { return 0; }
 template<bool is_simple> class sigMap;
 
 template<>
-class sigMap<false> : public std::tr1::unordered_map<imageId, SigStruct*> {
+class sigMap<false> : public imageIdMap<SigStruct*> {
 public:
 	void add_sig(imageId id, SigStruct* sig) { (*this)[id] = sig; }
 	void add_index(imageId id, size_t index) { throw usage_error("Only valid in read-only mode."); }
 };
 
 template<>
-class sigMap<true> : public std::tr1::unordered_map<imageId, size_t> {
+class sigMap<true> : public imageIdMap<size_t> {
 public:
 	void add_sig(imageId id, SigStruct* sig) { throw usage_error("Not valid in read-only mode."); }
 	void add_index(imageId id, size_t index) { (*this)[id] = index; }
@@ -461,13 +483,24 @@ public:
 	virtual void addImage(imageId id, const char* filename);
 	virtual void addImageBlob(imageId id, const void *blob, size_t length);
 
-	static void imgDataFromFile(const char* filename, ImgData* img);
+	static void imgDataFromFile(const char* filename, imageId id, ImgData* img);
 
 	static bool is_grayscale(const lumin_int& avgl);
 
+	virtual bool isImageGrayscale(imageId id);
+	virtual Score calcAvglDiff(imageId id1, imageId id2);
+	virtual Score calcSim(imageId id1, imageId id2, bool ignore_color = false);
+	virtual Score calcDiff(imageId id1, imageId id2, bool ignore_color = false);
+
+	static const int mode_mask_readonly	= 0x01;
+	static const int mode_mask_simple	= 0x02;
+	static const int mode_mask_alter	= 0x04;
+
 protected:
+	virtual void getImgDataByID(imageId id, ImgData* img) = 0;
+	virtual void getImgAvgl(imageId id, lumin_int avgl) = 0;
+
 	static void sigFromImage(Image* image, imageId id, ImgData* sig);
-	static Image* imageFromFile(const char* filename);
 
 	template<typename B>
 	class bucket_set {
@@ -526,7 +559,6 @@ public:
 	virtual bool hasImage(imageId id);
 	virtual int getImageHeight(imageId id);
 	virtual int getImageWidth(imageId id);
-	virtual bool isImageGrayscale(imageId id);
 	virtual imageId_list getImgIdList();
 	virtual image_info_list getImgInfoList();
 
@@ -536,12 +568,6 @@ public:
 
 	virtual void removeImage(imageId id);
 	virtual void rehash();
-
-	// Similarity.
-	virtual Score calcAvglDiff(imageId id1, imageId id2);
-	virtual Score calcSim(imageId id1, imageId id2, bool ignore_color = false);
-	virtual Score calcDiff(imageId id1, imageId id2, bool ignore_color = false);
-	virtual const lumin_int& getImageAvgl(imageId id);
 
 private:
 #ifdef USE_DISK_CACHE
@@ -573,6 +599,9 @@ private:
 	imageIterator image_end();
 
 	void addSigToBuckets(const ImgData* nsig);
+
+	void getImgDataByID(imageId id, ImgData* img) { *img = get_sig_from_cache(id); }
+	void getImgAvgl(imageId id, lumin_int avgl) { memcpy(avgl, find(id).avgl(), sizeof(avgl)); }
 
 	size_t get_sig_cache();
 	ImgData get_sig_from_cache(imageId i);
@@ -607,7 +636,7 @@ private:
 // Directly modify DB file on disk.
 class dbSpaceAlter : public dbSpaceCommon {
 public:
-	dbSpaceAlter();
+	dbSpaceAlter(bool readonly);
 	virtual ~dbSpaceAlter();
 
 	virtual void save_file(const char* filename);
@@ -616,13 +645,12 @@ public:
 	virtual sim_vector queryImg(const queryArg& query) { throw usage_error("Not supported in alter mode."); }
 	virtual void getImgQueryArg(imageId id, queryArg* query) { throw usage_error("Not supported in alter mode."); }
 
-	// Stats. Partially unsupported (* could easily be supported by reading from disk but isn't needed).
+	// Stats. Partially unsupported.
 	virtual size_t getImgCount();
 	virtual stats_t getCoeffStats() { throw usage_error("Not supported in alter mode."); }
 	virtual bool hasImage(imageId id);
 	virtual int getImageHeight(imageId id);
 	virtual int getImageWidth(imageId id);
-	virtual bool isImageGrayscale(imageId id) { throw usage_error("Not supported in alter mode."); } // *
 	virtual imageId_list getImgIdList();
 	virtual image_info_list getImgInfoList() { throw usage_error("Not supported in alter mode."); }
 
@@ -633,16 +661,12 @@ public:
 	virtual void removeImage(imageId id);
 	virtual void rehash();
 
-	// Similarity.
-	virtual Score calcAvglDiff(imageId id1, imageId id2) { throw usage_error("Not supported in alter mode."); } // *
-	virtual Score calcSim(imageId id1, imageId id2, bool ignore_color = false) { throw usage_error("Not supported in alter mode."); } // *
-	virtual Score calcDiff(imageId id1, imageId id2, bool ignore_color = false) { throw usage_error("Not supported in alter mode."); } // *
-	virtual const lumin_int& getImageAvgl(imageId id) { throw usage_error("Not supported in alter mode."); } // *
-
 protected:
-	typedef std::tr1::unordered_map<imageId, size_t> ImageMap;
+	typedef imageIdMap<size_t> ImageMap;
 
 	ImageMap::iterator find(imageId i);
+	void getImgDataByID(imageId id, ImgData* img) { *img = get_sig(m_images.find(id)->second); }
+	void getImgAvgl(imageId id, lumin_int avgl) { image_info::avglf2i(get_sig(m_images.find(id)->second).avglf, avgl); }
 	ImgData get_sig(size_t ind);
 
 	virtual void load(const char* filename);
@@ -670,6 +694,7 @@ private:
 	buckets_t m_buckets;
 	DeletedList m_deleted;
 	bool m_rewriteIDs;
+	bool m_readonly;
 };
 
 /* signature structure */

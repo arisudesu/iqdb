@@ -102,7 +102,7 @@ private function http_progress($ch,$data) {
 		} else if ($size[0] > $this->maxdim || $size[1] > $this->maxdim) {
 			#debug("Image too large! ".join(":", $size));
 			$this->stat = -5;
-			$this->err = array("", $size[0], $size[1]);
+			$this->err = array("", $size[0]." x ".$size[1]);
 			return 0;
 		}
 		#debug("Image OK!");

@@ -24,10 +24,17 @@
 #ifndef IMGDBASE_H
 #define IMGDBASE_H
 
+#include <math.h>
+
 // STL includes
 #include <map>
 #include <stdexcept>
 #include <vector>
+
+// STL TR1
+#ifndef NO_TR1
+#include <tr1/unordered_map>
+#endif
 
 // Haar transform defines
 #include "haar.h"
@@ -61,15 +68,15 @@ typedef int32_t Score;
 typedef int64_t DScore;
 
 // Exceptions.
-class generic_error : public std::exception {
+class base_error : public std::exception {
 public:
-	~generic_error() throw() { if (m_str) { delete m_str; m_str = NULL; } }
+	~base_error() throw() { if (m_str) { delete m_str; m_str = NULL; } }
 	const char* what() const throw() { return m_str ? m_str->c_str() : m_what; }
 	const char* type() const throw() { return m_type; }
 
 protected:
-	generic_error(const char* what, const char* type) throw() : m_what(what), m_type(type), m_str(NULL) { }
-	explicit generic_error(const std::string& what, const char* type) throw()
+	base_error(const char* what, const char* type) throw() : m_what(what), m_type(type), m_str(NULL) { }
+	explicit base_error(const std::string& what, const char* type) throw()
 		: m_what(NULL), m_type(type), m_str(new std::string(what)) { }
 private:
 	const char* m_what;
@@ -88,7 +95,7 @@ private:
 	};
 
 // Fatal, cannot recover, should discontinue using the dbSpace throwing it.
-DEFINE_ERROR(fatal_error,     generic_error)
+DEFINE_ERROR(fatal_error,     base_error)
 
 DEFINE_ERROR(io_error,        fatal_error)	// Non-recoverable IO error while read/writing database or cache.
 DEFINE_ERROR(data_error,      fatal_error)	// Database has internally inconsistent data.
@@ -96,7 +103,7 @@ DEFINE_ERROR(memory_error,    fatal_error)	// Database could not allocate memory
 DEFINE_ERROR(internal_error,  fatal_error)	// The library code has a bug.
 
 // Non-fatal, may retry the call after correcting the problem, and continue using the library.
-DEFINE_ERROR(simple_error,    generic_error)
+DEFINE_ERROR(simple_error,    base_error)
 
 DEFINE_ERROR(usage_error,     simple_error)	// Function call not available in current mode.
 DEFINE_ERROR(param_error,     simple_error)	// An argument was invalid, e.g. non-existent image ID.
@@ -105,6 +112,17 @@ DEFINE_ERROR(image_error,     simple_error)	// Could not successfully extract im
 // specific param_error exceptions
 DEFINE_ERROR(duplicate_id,    param_error)	// Image ID already in DB.
 DEFINE_ERROR(invalid_id,      param_error)	// Image ID not found in DB.
+
+// io_error with a specific errno
+class io_errno : public io_error {
+public:
+	io_errno(int code) throw() : io_error(NULL, "io_errno"), m_code(code) { }
+	const char* what() const throw() { return strerror(m_code); }
+	virtual int code() const throw() { return m_code; }
+
+private:
+	int m_code;
+};
 
 const Score ScoreScale = 20;
 const Score ScoreMax = (1 << ScoreScale);
@@ -146,6 +164,16 @@ typedef std::vector<image_info> image_info_list;
 typedef signed int lumin_int[3];
 typedef Idx sig_t[NUM_COEFS];
 
+#ifndef NO_TR1
+template<typename T>
+class imageIdMap : public std::tr1::unordered_map<imageId, T> {
+};
+#else
+template<typename T>
+class imageIdMap : public std::map<imageId, T> {
+};
+#endif
+
 struct ImgData {
 	imageId id;			/* picture id */
 	sig_t sig1;			/* Y positions with largest magnitude */
@@ -159,7 +187,6 @@ struct ImgData {
 
 class dbSpace;
 class bloom_filter;
-struct srzMetaDataStruct;
 class db_ifstream;
 class db_ofstream;
 
@@ -200,14 +227,15 @@ struct queryArg : public queryOpt {
 class dbSpace {
 public:
 	static const int mode_normal    = 0x00; // Full functionality, but slower queries.
-	static const int mode_readonly	= 0x01; // Fast queries, cannot save back to disk.
+	static const int mode_readonly	= 0x03; // Fast queries, cannot save back to disk.
 	static const int mode_simple	= 0x02; // Fast queries, less memory, cannot save, no image ID queries.
-	static const int mode_alter	= 0x03;	// Fast add/remove/info on existing DB file, no queries.
+	static const int mode_alter	= 0x04;	// Fast add/remove/info on existing DB file, no queries.
+	static const int mode_imgdata	= 0x05;	// Similar to mode_alter, but read-only, to retrieve image data.
 
 	// Image query flags.
 	static const int flag_sketch	= 0x01;	// Image is a sketch, use adjusted weights.
 	static const int flag_grayscale	= 0x02;	// Disregard color information from image.
-	static const int flag_onlyabove	= 0x04;	// For dupe finding: only check and return images beyond selected.
+		// unused at the moment	= 0x04;
 	static const int flag_uniqueset	= 0x08;	// Return only best match from each set.
 	static const int flag_nocommon	= 0x10;	// Disregard common coefficients (those which are present in at least 10% of the images).
 	static const int flag_fast	= 0x20;	// Check only DC coefficient (luminance).
@@ -225,7 +253,7 @@ public:
 	virtual sim_vector queryImg(const queryArg& query) = 0;
 
 	// Image data.
-	static void imgDataFromFile(const char* filename, ImgData* img);
+	static void imgDataFromFile(const char* filename, imageId id, ImgData* img);
 
 	// Initialize sig and avgl of the queryArg.
 	virtual void getImgQueryArg(imageId id, queryArg* query) = 0;
@@ -254,7 +282,6 @@ public:
 	virtual Score calcAvglDiff(imageId id1, imageId id2) = 0;
 	virtual Score calcSim(imageId id1, imageId id2, bool ignore_color = false) = 0;
 	virtual Score calcDiff(imageId id1, imageId id2, bool ignore_color = false) = 0;
-	virtual const lumin_int& getImageAvgl(imageId id) = 0;
 
 protected:
 	dbSpace();
@@ -292,7 +319,7 @@ inline queryArg::queryArg(const ImgData& img, unsigned int nr, int fl) : queryOp
 }
 inline queryArg::queryArg(const char* filename, unsigned int nr, int fl) : queryOpt(fl), numres(nr) {
 	ImgData img;
-	dbSpace::imgDataFromFile(filename, &img);
+	dbSpace::imgDataFromFile(filename, 0, &img);
 	dbSpace::queryFromImgData(img, this);
 }
 inline queryArg& queryArg::merge(const queryOpt& q) {

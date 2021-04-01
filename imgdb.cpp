@@ -27,7 +27,9 @@
 #include <stdlib.h>
 #include <time.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <ctime> 
 
 /* STL includes */
@@ -50,7 +52,7 @@ Score weights[2][6][3];
 Each entry x = i*NUM_PIXELS + j, gets value max(i,j) saturated at 5.
 To be treated as a constant.
  */
-unsigned char imgBin[16384];
+unsigned char imgBin[NUM_PIXELS*NUM_PIXELS];
 int imgBinInited = 0;
 
 unsigned int random_bloom_seed = 0;
@@ -88,8 +90,15 @@ T flipped_endian(T& v) {
 
 //typedef std::priority_queue < KwdFrequencyStruct > kwdFreqPriorityQueue;
 
-template<bool is_simple>
-inline void imageIdIndex_map<is_simple>::unmap() {
+mapped_file::mapped_file(const char* fname, bool writable) {
+	int fd = open(fname, writable ? O_RDWR : O_RDONLY);
+	struct stat st;
+	if (fd == -1 || fstat(fd, &st) || (m_base = (unsigned char*) mmap(NULL, m_length = st.st_size, writable ? PROT_READ | PROT_WRITE : PROT_READ, MAP_SHARED, fd, 0)) == MAP_FAILED)
+		throw image_error("Can't open/stat/map file.");
+	close(fd);
+}
+
+inline void mapped_file::unmap() {
 	if (!m_base) return;
 	if (munmap(m_base, m_length))
 		fprintf(stderr, "WARNING: Could not unmap %zd bytes of memory.\n", m_length);
@@ -320,7 +329,7 @@ void initImgBin()
 	/* Except for the 5 by 5 upper-left quadrant: */
 	for (i = 0; i < 5; i++)
 		for (j = 0; j < 5; j++)
-			imgBin[i * 128 + j] = std::max(i, j);
+			imgBin[i * NUM_PIXELS + j] = std::max(i, j);
 	// Note: imgBin[0] == 0
 
 	/* Integer weights. */
@@ -376,22 +385,18 @@ inline bool dbSpaceCommon::is_grayscale(const lumin_int& avgl) {
 	return abs(avgl[1]) + abs(avgl[2]) < ScoreMax * 6 / 1000;
 }
 
-template<bool is_simple>
-bool dbSpaceImpl<is_simple>::isImageGrayscale(imageId id) {
-	return is_grayscale(find(id).avgl());
-}
-
-template<bool is_simple>
-const lumin_int& dbSpaceImpl<is_simple>::getImageAvgl(imageId id) {
-	return find(id).avgl();
+bool dbSpaceCommon::isImageGrayscale(imageId id) {
+	lumin_int avgl;
+	getImgAvgl(id, avgl);
+	return is_grayscale(avgl);
 }
 
 void dbSpaceCommon::sigFromImage(Image* image, imageId id, ImgData* sig) {
-	// Made static for speed; only used locally
-	static Unit cdata1[16384];
-	static Unit cdata2[16384];
-	static Unit cdata3[16384];
+	AutoCleanArray<unsigned char> rchan(NUM_PIXELS*NUM_PIXELS);
+	AutoCleanArray<unsigned char> gchan(NUM_PIXELS*NUM_PIXELS);
+	AutoCleanArray<unsigned char> bchan(NUM_PIXELS*NUM_PIXELS);
 
+#if LIB_ImageMagick
 	AutoExceptionInfo exception;
 
 	/*
@@ -402,10 +407,10 @@ void dbSpaceCommon::sigFromImage(Image* image, imageId id, ImgData* sig) {
 	sig->width = image->columns;
 	sig->height = image->rows;
 
-	//resize_image = SampleImage(image, 128, 128, &exception);
+	//resize_image = SampleImage(image, NUM_PIXELS, NUM_PIXELS, &exception);
 	Image* resize_image = NULL;
-	if (image->columns != 128 || image->rows != 128) {
-		resize_image = ResizeImage(image, 128, 128, TriangleFilter, 1.0, &exception);
+	if (image->columns != NUM_PIXELS || image->rows != NUM_PIXELS) {
+		resize_image = ResizeImage(image, NUM_PIXELS, NUM_PIXELS, TriangleFilter, 1.0, &exception);
 		if (!resize_image)
 			throw image_error("Unable to resize image.");
 		image = resize_image;
@@ -413,22 +418,43 @@ void dbSpaceCommon::sigFromImage(Image* image, imageId id, ImgData* sig) {
 	// To clean up resize_image on return or exceptions.
 	AutoImage resize_image_auto(resize_image);
 
-	unsigned char rchan[16384];
-	unsigned char gchan[16384];
-	unsigned char bchan[16384];
+	const PixelPacket *pixel_cache = AcquireImagePixels(image, 0, 0, NUM_PIXELS, NUM_PIXELS, &exception);
 
-	const PixelPacket *pixel_cache = AcquireImagePixels(image, 0, 0, 128, 128, &exception);
-
-	for (int idx = 0; idx < 16384; idx++) {
+	for (int idx = 0; idx < NUM_PIXELS*NUM_PIXELS; idx++) {
 		rchan[idx] = pixel_cache->red >> (QuantumDepth - 8);
 		gchan[idx] = pixel_cache->green >> (QuantumDepth - 8);
 		bchan[idx] = pixel_cache->blue >> (QuantumDepth - 8);
 		pixel_cache++;
 	}
+#elif LIB_GD
+	sig->id = id;
+	sig->width = image->sx;
+	sig->height = image->sy;
 
-	transformChar(rchan, gchan, bchan, cdata1, cdata2, cdata3);
+	AutoGDImage resized;
+	if (image->sx != NUM_PIXELS || image->sy != NUM_PIXELS || !gdImageTrueColor(image)) {
+		resized.set(gdImageCreateTrueColor(NUM_PIXELS, NUM_PIXELS));
+		gdImageFilledRectangle(resized, 0, 0, NUM_PIXELS, NUM_PIXELS, gdTrueColor(255, 255, 255));
+		gdImageCopyResampled(resized, image, 0, 0, 0, 0, NUM_PIXELS, NUM_PIXELS, image->sx, image->sy);
+		image = resized;
+	}
 
-	calcHaar(cdata1, cdata2, cdata3, sig->sig1, sig->sig2, sig->sig3, sig->avglf);
+	unsigned char* red = rchan.ptr(), *green = gchan.ptr(), *blue = bchan.ptr();
+	for (int** row = image->tpixels; row < image->tpixels + NUM_PIXELS; row++)
+	    for (int* col = *row, *end = *row + NUM_PIXELS; col < end; col++) {
+		*red++ = gdTrueColorGetRed(*col);
+		*green++ = gdTrueColorGetGreen(*col);
+		*blue++ = gdTrueColorGetBlue(*col);
+	}
+#else
+#	error Unsupported image library.
+#endif
+
+	AutoCleanArray<Unit> cdata1(NUM_PIXELS*NUM_PIXELS);
+	AutoCleanArray<Unit> cdata2(NUM_PIXELS*NUM_PIXELS);
+	AutoCleanArray<Unit> cdata3(NUM_PIXELS*NUM_PIXELS);
+	transformChar(rchan.ptr(), gchan.ptr(), bchan.ptr(), cdata1.ptr(), cdata2.ptr(), cdata3.ptr());
+	calcHaar(cdata1.ptr(), cdata2.ptr(), cdata3.ptr(), sig->sig1, sig->sig2, sig->sig3, sig->avglf);
 }
 
 template<typename B>
@@ -549,6 +575,8 @@ void dbSpaceImpl<true>::addImageData(const ImgData* img) {
 }
 
 void dbSpaceAlter::addImageData(const ImgData* img) {
+	if (m_readonly)
+		throw usage_error("Not possible in imgdata mode.");
 	if (hasImage(img->id)) // image already in db
 		throw duplicate_id("Image already in database.");
 
@@ -576,6 +604,7 @@ void dbSpaceAlter::addImageData(const ImgData* img) {
 	m_images[img->id] = ind;
 }
 
+#if LIB_ImageMagick
 inline void check_image(Image* image) {
 	if (!image)	// unable to read image
 		throw image_error("Unable to read image data.");
@@ -595,44 +624,60 @@ void dbSpaceCommon::addImageBlob(imageId id, const void *blob, size_t length) {
 
 	AutoExceptionInfo exception;
 	AutoImageInfo image_info;
-	AutoImage image(BlobToImage(&image_info, blob, length, &exception));
+	AutoImage image(BlobToImage(image_info, blob, length, &exception));
 	if (exception.severity != UndefinedException) CatchException(&exception);
-	check_image(&image);
+	check_image(image);
 
 	ImgData sig;
-	sigFromImage(&image, id, &sig);
+	sigFromImage(image, id, &sig);
 	return addImageData(&sig);
 }
 
-Image* dbSpaceCommon::imageFromFile(const char* filename) {
+void dbSpaceCommon::imgDataFromFile(const char* filename, imageId id, ImgData* img) {
 	AutoExceptionInfo exception;
 	AutoImageInfo image_info;
 
 	strcpy(image_info->filename, filename);
-	Image* image = ReadImage(&image_info, &exception);
+	AutoImage image(ReadImage(image_info, &exception));
 	if (exception.severity != UndefinedException) CatchException(&exception);
 	check_image(image);
-	return image;
+	sigFromImage(image, id, img);
 }
+
+#elif LIB_GD
+void dbSpaceCommon::addImageBlob(imageId id, const void *blob, size_t length) {
+	if (hasImage(id)) // image already in db
+		throw duplicate_id("Image already in database.");
+
+	::image_info info;
+	get_image_info((const unsigned char*) blob, length, &info);
+
+	AutoGDImage image(resize_image_data((const unsigned char*) blob, length, NUM_PIXELS, NUM_PIXELS, true));
+
+	ImgData sig;
+	sigFromImage(image, id, &sig);
+	return addImageData(&sig);
+}
+
+void dbSpaceCommon::imgDataFromFile(const char* filename, imageId id, ImgData* img) {
+	AutoClean<mapped_file, &mapped_file::unmap> map(mapped_file(filename, false));
+	AutoGDImage image(resize_image_data((const unsigned char*) map.m_base, map.m_length, NUM_PIXELS, NUM_PIXELS, true));
+	sigFromImage(image, id, img);
+}
+
+#endif
 
 void dbSpaceCommon::addImage(imageId id, const char *filename) {
 	if (hasImage(id)) // image already in db
 		throw duplicate_id("Image already in database.");
 
-	AutoImage image(imageFromFile(filename));
-
 	ImgData sig;
-	sigFromImage(&image, id, &sig);
+	imgDataFromFile(filename, id, &sig);
 	return addImageData(&sig);
 }
 
-void dbSpaceCommon::imgDataFromFile(const char* filename, ImgData* img) {
-	AutoImage image(imageFromFile(filename));
-	sigFromImage(&image, 0, img);
-}
-
-void dbSpace::imgDataFromFile(const char* filename, ImgData* img) {
-	return dbSpaceCommon::imgDataFromFile(filename, img);
+void dbSpace::imgDataFromFile(const char* filename, imageId id, ImgData* img) {
+	return dbSpaceCommon::imgDataFromFile(filename, id, img);
 }
 
 template<>
@@ -652,6 +697,9 @@ template<> void dbSpaceImpl<true>::setImageRes(imageId id, int width, int height
 }
 
 void dbSpaceAlter::setImageRes(imageId id, int width, int height) {
+	if (m_readonly)
+		throw usage_error("Not possible in imgdata mode.");
+
 	size_t ind = find(id)->second;
 	ImgData sig = get_sig(ind);
 	m_f->seekg(m_sigOff + ind * sizeof(ImgData));
@@ -695,7 +743,7 @@ fprintf(stderr, "has %zd images at %llx. ", numImg, (long long)firstOff);
 fprintf(stderr, "bucket sizes done at %llx... ", (long long)firstOff);
 
 	// read IDs (for verification only)
-	AutoCleanArray<imageId> ids(new imageId[numImg]);
+	AutoCleanArray<imageId> ids(numImg);
 	f.read(ids.ptr(), numImg);
 	for (typename image_map::size_type k = 0; k < numImg; k++)
 		FLIP(ids[k]);
@@ -788,7 +836,7 @@ fprintf(stderr, "has %zd images. ", numImg);
 
 		m_rewriteIDs = false;
 fprintf(stderr, "complete!\n");
-	} catch (const generic_error& e) {
+	} catch (const base_error& e) {
 		if (m_f) {
 			if (m_f->is_open()) m_f->close();
 			delete m_f;
@@ -977,11 +1025,11 @@ fprintf(stderr, "complete!\n");
 }
 
 static inline dbSpace* make_dbSpace(int mode) {
-	return	  mode == dbSpace::mode_alter
-			? static_cast<dbSpace*>(new dbSpaceAlter())
-		: mode != dbSpace::mode_normal
-			? static_cast<dbSpace*>(new dbSpaceImpl<true>(mode != dbSpace::mode_simple))
-			: static_cast<dbSpace*>(new dbSpaceImpl<false>(true));
+	return	  mode & dbSpaceCommon::mode_mask_alter
+			? static_cast<dbSpace*>(new dbSpaceAlter(mode & dbSpaceCommon::mode_mask_readonly))
+		: mode & dbSpaceCommon::mode_mask_simple
+			? static_cast<dbSpace*>(new dbSpaceImpl<true>(mode & dbSpaceCommon::mode_mask_readonly))
+		: static_cast<dbSpace*>(new dbSpaceImpl<false>(true));
 };
 
 dbSpace* dbSpace::load_file(const char *filename, int mode) {
@@ -1054,6 +1102,9 @@ struct in_deleted_tail : public std::unary_function<size_t, bool> {
 
 // Relocate sigs from the end into the holes left by deleted images.
 void dbSpaceAlter::move_deleted() {
+	if (m_readonly)
+		throw usage_error("Not possible in imgdata mode.");
+
 	// need to find out which IDs are using the last few indices
 	DeletedList::iterator delItr = m_deleted.begin();
 	for (ImageMap::iterator itr = m_images.begin(); ; ++itr) {
@@ -1086,6 +1137,9 @@ void dbSpaceAlter::move_deleted() {
 }
 
 void dbSpaceAlter::save_file(const char* filename) {
+	if (m_readonly)
+		throw usage_error("Not possible in imgdata mode.");
+
 	if (!m_f) return;
 	if (filename && m_fname != filename)
 		throw param_error("Cannot save to different filename.");
@@ -1127,6 +1181,9 @@ fprintf(stderr, "done!\n");
 // image signatures to the end of the file and use the freed space
 // for new image IDs until we run out of space again.
 void dbSpaceAlter::resize_header() {
+	if (m_readonly)
+		throw usage_error("Not possible in imgdata mode.");
+
   // make space for 1024 new IDs
   size_t numrel = (1024 * sizeof(imageId) + sizeof(ImgData) - 1) / sizeof(ImgData);
 fprintf(stderr, "relocating %zd/%zd images... from %llx ", numrel, m_images.size(), (long long int) m_sigOff);
@@ -1176,7 +1233,7 @@ sim_vector dbSpaceImpl<is_simple>::do_query(queryArg q) {
 	if (!m_bucketsValid) throw usage_error("Can't query with invalid buckets.");
 
 	size_t count = m_nextIndex;
-	AutoCleanArray<Score> scores(new Score[count]);
+	AutoCleanArray<Score> scores(count);
 
 	// Luminance score (DC coefficient).
 	for (imageIterator itr = image_begin(); itr != image_end(); ++itr) {
@@ -1186,6 +1243,13 @@ sim_vector dbSpaceImpl<is_simple>::do_query(queryArg q) {
 		scores[itr.index()] = s;
 	}
 
+#if QUERYSTATS
+	size_t coefcnt = 0, coeflen = 0, coefmax = 0;
+	size_t setcnt[NUM_COEFS * num_colors];
+	AutoCleanArray<uint8_t> counts(count);
+	memset(counts.ptr(), 0, sizeof(counts[0])*count);
+	memset(setcnt, 0, sizeof(setcnt));
+#endif
 	for (int b = (q.flags & flag_fast) ? NUM_COEFS : 0; b < NUM_COEFS; b++) {	// for every coef on a sig
 		for (c = 0; c < num_colors; c++) {
 			int idx;
@@ -1199,10 +1263,23 @@ sim_vector dbSpaceImpl<is_simple>::do_query(queryArg q) {
 
 			// update the score of every image which has this coef
 			AutoImageIdIndex_map<is_simple> map(bucket.map_all(false));
-			for (idIndexIterator itr(map.begin(), *this); itr != map.end(); ++itr)
+#if QUERYSTATS
+			size_t len = bucket.size();
+			coeflen += len; coefmax = std::max(coefmax, len);
+			coefcnt++;
+#endif
+			for (idIndexIterator itr(map.begin(), *this); itr != map.end(); ++itr) {
 				scores[itr.index()] -= weight;
-			for (idIndexTailIterator itr(bucket.tail().begin(), *this); itr != bucket.tail().end(); ++itr)
+#if QUERYSTATS
+				counts[itr.index()]++;
+#endif
+			}
+			for (idIndexTailIterator itr(bucket.tail().begin(), *this); itr != bucket.tail().end(); ++itr) {
 				scores[itr.index()] -= weight;
+#if QUERYSTATS
+				counts[itr.index()]++;
+#endif
+			}
 		}
 	}
 
@@ -1220,8 +1297,12 @@ sim_vector dbSpaceImpl<is_simple>::do_query(queryArg q) {
 
 	// Fill up the numres-bounded priority queue (largest at top):
 	while (pqResults.size() < need && itr != image_end()) {
+//fprintf(stderr, "ID %08lx mask %x qflm %d %x -> %x = %x?\n", itr.id(), itr.mask(), q.flags & flag_mask, q.mask_and, itr.mask() & q.mask_and,q.mask_xor);
 		if (skip_image(itr, q)) { ++itr; continue; }
 
+#if QUERYSTATS
+		setcnt[counts[itr.index()]]++;
+#endif
 		pqResults.push(sim_result<is_simple>(scores[itr.index()], itr));
 
 		if (q.flags & flag_uniqueset) //{
@@ -1232,7 +1313,11 @@ sim_vector dbSpaceImpl<is_simple>::do_query(queryArg q) {
 
 	for (; itr != image_end(); ++itr) {
 		// only consider if not ignored due to keywords and if is a better match than the current worst match
+#if QUERYSTATS
+		if (!skip_image(itr, q)) setcnt[counts[itr.index()]]++;
+#endif
 		if (scores[itr.index()] < pqResults.top().score) {
+//fprintf(stderr, "ID %08lx mask %x qflm %d %x -> %x = %x?\n", itr.id(), itr.mask(), q.flags & flag_mask, q.mask_and, itr.mask() & q.mask_and,q.mask_xor);
 			if (skip_image(itr, q)) continue;
 
 			// Make room by dropping largest entry:
@@ -1254,6 +1339,7 @@ sim_vector dbSpaceImpl<is_simple>::do_query(queryArg q) {
 		}
 	}
 
+//fprintf(stderr, "Have %zd images in result set.\n", pqResults.size());
 	scale = ((DScore) ScoreMax) * ScoreMax / scale;
 	while (!pqResults.empty()) {
 		const sim_result<is_simple>& curResTmp = pqResults.top();
@@ -1266,7 +1352,24 @@ sim_vector dbSpaceImpl<is_simple>::do_query(queryArg q) {
 		pqResults.pop();
 	}
 
+#if QUERYSTATS
+	size_t num = 0;
+	for (size_t i = 0; i < sizeof(setcnt)/sizeof(setcnt[0]); i++) num += setcnt[i];
+	fprintf(stderr, "Query complete, coefcnt=%zd coeflen=%zd coefmax=%zd numset=%zd/%zd\nCounts: ", coefcnt, coeflen, coefmax, num, m_images.size());
+	num = 0;
+	for (size_t i = sizeof(setcnt)/sizeof(setcnt[0]) - 1; i > 0 && num < 10; i--) if (setcnt[i]) {
+		num++;
+		fprintf(stderr, "%zd=%zd; ", i, setcnt[i]);
+	}
+	fprintf(stderr, "\n");
+	/*\
+	|* Results:
+	|* coefcnt=120  coeflen ~ 20*numimg  coefmax ~ numimg/2  numset > 99.99%
+	|* counts on match: ~100-120 1  counts on semi-match: ~60-95 1-2  counts on no match: ~50 and lower
+	\*/
+#endif
 	std::reverse(V.begin(), V.end());
+//fprintf(stderr, "Returning %zd images.\n", V.size());
 	return V;
 
 }
@@ -1342,6 +1445,9 @@ void dbSpaceImpl<true>::removeImage(imageId id) {
 }
 
 void dbSpaceAlter::removeImage(imageId id) {
+	if (m_readonly)
+		throw usage_error("Not possible in imgdata mode.");
+
 	ImageMap::iterator itr = find(id);
 	m_deleted.push_back(itr->second);
 	m_images.erase(itr);
@@ -1368,51 +1474,59 @@ inline void dbSpaceCommon::bucket_set<B>::remove(const ImgData& nsig) {
 	}
 }
 
-template<bool is_simple>
-Score dbSpaceImpl<is_simple>::calcAvglDiff(imageId id1, imageId id2) {
+Score dbSpaceCommon::calcAvglDiff(imageId id1, imageId id2) {
 	/* return the average luminance difference */
 
 	// are images on db ?
-	const lumin_int& avgl1 = find(id1).avgl();
-	const lumin_int& avgl2 = find(id2).avgl();
+	lumin_int avgl1, avgl2;
+	getImgAvgl(id1, avgl1);
+	getImgAvgl(id2, avgl2);
 	return abs(avgl1[0] - avgl2[0]) + abs(avgl1[1] - avgl2[1]) + abs(avgl1[2] - avgl2[2]);
 }	
 
-template<bool is_simple>
-Score dbSpaceImpl<is_simple>::calcSim(imageId id1, imageId id2, bool ignore_color)
-{
-	/* use it to tell the content-based difference between two images
-	 */
-	ImgData dsig1 = get_sig_from_cache(id1);
-	ImgData dsig2 = get_sig_from_cache(id2);
+Score dbSpaceCommon::calcSim(imageId id1, imageId id2, bool ignore_color) {
+	/* use it to tell the content-based difference between two images */
+	ImgData dsig1, dsig2;
+	getImgDataByID(id1, &dsig1);
+	getImgDataByID(id2, &dsig2);
 
-	const Idx* sig1[3] = { dsig1.sig1, dsig1.sig2, dsig1.sig3 };
-	const Idx* sig2[3] = { dsig2.sig1, dsig2.sig2, dsig2.sig3 };
-
-	int cnum = ignore_color ? 1 : 3;
+	Idx* const sig1[3] = { dsig1.sig1, dsig1.sig2, dsig1.sig3 };
+	Idx* const sig2[3] = { dsig2.sig1, dsig2.sig2, dsig2.sig3 };
 
 	Score score = 0, scale = 0;
-	const lumin_int& avgl1 = find(id1).avgl();
-	const lumin_int& avgl2 = find(id2).avgl();
+	lumin_int avgl1, avgl2;
+	image_info::avglf2i(dsig1.avglf, avgl1);
+	image_info::avglf2i(dsig2.avglf, avgl2);
+
+	int cnum = ignore_color || is_grayscale(avgl1) || is_grayscale(avgl2) ? 1 : 3;
 
 	for (int c = 0; c < cnum; c++)
-		score += (((DScore)weights[0][0][c]) * abs(avgl1[c] - avgl2[c])) >> ScoreScale;
+		score += (2*((DScore)weights[0][0][c]) * abs(avgl1[c] - avgl2[c])) >> ScoreScale;
 
-	for (int b = 0; b < NUM_COEFS; b++)
-		for (int c = 0; c < cnum; c++)
-			for (int b2 = 0; b2 < NUM_COEFS; b2++) {
-				Score weight = weights[0][imgBin[abs(sig1[c][b])]][c];
-				scale -= weight;
-				if (sig2[c][b2] == sig1[c][b])
-					score -= weight;
-			}
+	for (int c = 0; c < cnum; c++) {
+		std::sort(sig1[c] + 0, sig1[c] + NUM_COEFS);
+		std::sort(sig2[c] + 0, sig2[c] + NUM_COEFS);
+
+		for (int b1 = 0, b2 = 0; b1 < NUM_COEFS || b2 < NUM_COEFS; ) {
+			int ind1 = b1 == NUM_COEFS ? std::numeric_limits<int>::max() : sig1[c][b1];
+			int ind2 = b2 == NUM_COEFS ? std::numeric_limits<int>::max() : sig2[c][b2];
+
+			Score weight = weights[0][imgBin[abs(ind1 < ind2 ? ind1 : ind2)]][c];
+			scale -= weight;
+
+			if (ind1 == ind2)
+				score -= weight;
+
+			b1 += ind1 <= ind2;
+			b2 += ind2 <= ind1;
+		}
+	}
 
 	scale = ((DScore) ScoreMax) * ScoreMax / scale;
 	return (((DScore) score) * 100 * scale) >> ScoreScale;
 }
 
-template<bool is_simple>
-Score dbSpaceImpl<is_simple>::calcDiff(imageId id1, imageId id2, bool ignore_color) {
+Score dbSpaceCommon::calcDiff(imageId id1, imageId id2, bool ignore_color) {
 	return 100 * ScoreMax - calcSim(id1, id2, ignore_color);
 }
 
@@ -1436,6 +1550,9 @@ void dbSpaceImpl<false>::rehash() {
 template<> void dbSpaceImpl<true>::rehash() { throw usage_error("Invalid for read-only db."); }
 
 void dbSpaceAlter::rehash() {
+	if (m_readonly)
+		throw usage_error("Not possible in imgdata mode.");
+
 	memset(m_buckets.begin(), 0, m_buckets.size());
 
 	for (ImageMap::iterator it = m_images.begin(); it != m_images.end(); ++it)
@@ -1806,7 +1923,7 @@ dbSpaceImpl<is_simple>::dbSpaceImpl(bool with_struct) :
 	// imgIdsFilter = new bloom_filter(AVG_IMGS_PER_DBSPACE, 1.0/(100.0 * AVG_IMGS_PER_DBSPACE),random_bloom_seed);
 }
 
-dbSpaceAlter::dbSpaceAlter() : m_f(NULL) {
+dbSpaceAlter::dbSpaceAlter(bool readonly) : m_f(NULL), m_readonly(readonly) {
 	if (!imgBinInited) initImgBin();
 }
 
@@ -1825,7 +1942,7 @@ dbSpaceImpl<true>::~dbSpaceImpl() {
 }
 
 dbSpaceAlter::~dbSpaceAlter() {
-	if (m_f) {
+	if (m_f && !m_readonly) {
 		save_file(NULL);
 		m_f->close();
 		delete m_f;

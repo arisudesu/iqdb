@@ -43,6 +43,9 @@ elif [ "$MODE" != "restart" ]; then
 	exit 1;
 fi;
 
+echo Starting dler...
+screen -dmS dlerDeb gdb -ex "r" -ex "call close_listen()" --args dler.server 5801
+
 SCREEN=iqdbOne
 OTHER=iqdbTwo
 screen -ls|grep iqdb

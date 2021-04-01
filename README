@@ -6,8 +6,10 @@ see the file COPYING for details.
 
 1) Compiling
 
-- install the ImageMagick development package
-  (on Debian: libmagick9-dev, on Fedora: ImageMagick-devel)
+- install either the libGD+libpng+libjpeg, or the ImageMagick dev package
+  Using GD, on Debian: libgd2-xpm-dev libpng12-dev libjpeg62-dev
+  Using ImageMagick, on Debian: libmagick9-dev, on Fedora: ImageMagick-devel)
+- check the top of the Makefile for settings
 - run make
 - if it fails, fix the Makefile or something
 
@@ -119,6 +121,8 @@ The server has the following possible responses:
 		Query result.
 	201 <dbid> <imgid> <score> <width> <height>
 		Multi-query result.
+	202 <original id>=<std.dev> <dupe1 id>:<sim1> [...]
+		Duplicate finder result.
 	300 <text>
 		General error message.
 	301 <exception> <description>

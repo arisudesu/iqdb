@@ -2,10 +2,8 @@ Scripts for indexing a Danbooru image database using iqdb.
 
 These scripts are very specific and you'll probably have to customize them
 heavily to suit your purposes. They assume a 3-level directory structure of 16
-subdirectories each to hold the MD5-based preview files. The first 32 bits of
-the MD5 are used as image DB for iqdb. If there's a collision, both files are
-moved to the xx/ directory instead and receive a new random image ID prefix.
-You can use make_dirs to create this structure.
+subdirectories each to hold the MD5-based preview files. You can use make_dirs
+to create this structure.
 
 danbooru-refresh
 	Script designed to be run from cron to periodically remove old images
@@ -13,10 +11,9 @@ danbooru-refresh
 
 	Adjust the directory and DB names, and the HTTP proxy line.
 
-danbooru-update
+danbooru-change
 	Called by the above to download previews for new posts, and to check
-	deleted posts once a day. Also stores image resolutions for services
-	that provide them.
+	deleted posts once a day. Also stores post data in a mysql database.
 
 	Adjust the directory names, and create the appropriate tag cfg files,
 	which should hold the login and password hash as described in the
@@ -25,7 +22,7 @@ danbooru-update
 		$pw='1234abcd1234abcd1234abcd1234abcd1234abcd';
 		$host="danbooru.donmai.us";
 
-danbooru-db:
-	Check directory structure for dupe image IDs, and move them to xx/,
-	removes deleted images and then adds new ones to the database.
-
+mkdup:
+	A script that builds and maintains an IQDB database along with a DB
+	of filenames it contains. It uses iqdb's dupe finder function to
+	generate a list of similar images. See its comment for more info.

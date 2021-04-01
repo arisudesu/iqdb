@@ -5,12 +5,16 @@ use strict;
 
 use DBI;
 use URI::Escape;
+use File::Find;
+use Compress::Zlib;
+
+die "No lockfile!\n" unless -e "update.lock";
 
 #system("renice 15 $$");
 my $tag = shift or die "Give server tag on command line.\n";
 my $no_online = shift, 1 if @ARGV and $ARGV[0] eq '-r';
 my $mode = "update";
-$mode = shift if @ARGV and ($ARGV[0] eq 'full' or $ARGV[0] eq 'deleted');
+$mode = shift if @ARGV and ($ARGV[0] =~ /^[a-z]+$/);
 my $max = 0+(shift||0);
 my $cnt = 0;
 print "Getting no more than $max posts.\n" if $max > 0;
@@ -21,6 +25,8 @@ $db_file="/opt/stuff/$db_file";
 die "$db_file does not exist\n" unless -e $db_file;
 chdir "$ENV{HOME}/doujin/$tag" or die "Can't chdir: $!\n";
 
+print "Site: $tag Mode: $mode\n";
+
 my $last_change = get_last('change');
 my $last_post = get_last('id');
 
@@ -29,6 +35,17 @@ open my $f, "<", $pwfile or die "Can't read $pwfile: $!\n";
 my $password = <$f>;
 chomp $password;
 die "No password in $pwfile\n" unless $password;
+
+my %ids_db;
+my %ids_online;
+my %md5;
+
+if ($mode eq 'fromdb') {
+	print "Finding images... ";
+	find({ wanted => sub { return unless -f and m#^([0-9a-f]{32})\.#; $md5{$1} = 1; } }, "0".."9", "a".."f");
+	print scalar keys %md5, " found.\n";
+	get_ids();
+}
 
 my $dbh = DBI->connect("DBI:mysql:database=sim:host=localhost", "simadmin", $password)
 	or die "Can't connect to database: $DBI::errstr\n";
@@ -57,6 +74,8 @@ my @add;
 my @insert;
 my @update;
 
+my @tofetch;
+
 my %deleted;
 
 my $sth_chk = $dbh->prepare("select rating from $table where id=?") or exit 1;
@@ -67,18 +86,38 @@ my %ratings = (a => 0x02, e => 0x04, q => 0x08, s => 0x10);
 my $warn = 0;
 my $err = 0;
 my $last_del = 0;
+
+my $sth;
+if ($mode eq 'fromdb') {
+	$sth = $dbh->prepare("select * from $table") or exit 1;
+	$sth->execute();
+}
+
+AGAIN:
 while(!$max or $cnt < $max) {
 	my $query;
+	my $posts;
 	if ($mode eq 'full') {
 		$query = "change:>$last_change order:change";
 	} elsif ($mode eq 'deleted') {
 		$query = "id:>$last_del order:id deleted:true";
 	} elsif ($mode eq 'update') {
 		$query = "id:>$last_post order:id";
+	} elsif ($mode eq 'fromdb') {
+		if (@tofetch) {
+			my $md5 = shift @tofetch;
+			print "Trying to get MD5 $md5...\n";
+			$query = "md5:$md5";
+		} else {
+			last unless $sth;
+			my $row = $sth->fetchrow_hashref or last;
+			$posts = MyUserAgent::parse(Compress::Zlib::uncompress($row->{post}));
+			$_->{noinsert} = 1 for @$posts;
+		}
 	} else {
 		die "Unknown mode: $mode\n";
 	}
-	my $posts = $ua->get_posts("http://$host/post/index.xml?limit=100&login=$user&password_hash=$pw&tags=".uri_escape $query);
+	$posts = $ua->get_posts("http://$host/post/index.xml?limit=100&login=$user&password_hash=$pw&tags=".uri_escape $query) if $query;
 	last unless @$posts;
 	for (@$posts) {
 		process() or $err++;
@@ -86,9 +125,24 @@ while(!$max or $cnt < $max) {
 	die "Had errors.\n" if $err;
 	die "Had $warn warnings.\n" if $warn > 4;
 
-	print "Last change ID and post ID so far: $last_change - $last_post\n";
+	print "Last change ID and post ID so far: $last_change - $last_post\n" unless $mode eq 'fromdb';
 	update() if @add >= 500 or @insert >= 500;
 }
+
+$sth = undef;
+print "Checking ", scalar keys %md5, " known MD5s...\n" if $mode eq 'fromdb';
+for (keys %md5) {
+	next unless $md5{$_};
+	print "No post for $_! " and $warn++;
+	/^(.)(.)(.)/;
+	my $file = "$1/$2/$3/$_.jpg";
+	print "But $file doesn't exist either!!\n" and next unless -f $file;
+	push @tofetch, $_;
+	print "Moving to todelete/. ";
+	rename $file, "todelete/$_.jpg" or warn "Can't move: $!\n" and next;
+	print "OK.\n";
+}
+goto AGAIN if @tofetch;
 
 update();
 die "Had $warn warnings.\n" if $warn;
@@ -117,7 +171,7 @@ sub process {
 	$id = 0 + $id;
 
 	my $change = $_->{change};
-	die "Invalid change ID $change: $_\n" unless $change eq 0 + $change;
+	warn "Invalid change ID $change: @{[%$_]}\n" and $warn++ unless $change eq 0 + $change;
 	$last_change=0+$change if $change > $last_change;
 	$last_post=0+$id if $id > $last_post;
 	$last_del=0+$id if $id > $last_del;
@@ -135,9 +189,10 @@ sub process {
 
 	if ($_->{status} eq 'deleted') {
 		print "DELETED" unless $max;
-		push @remove, sprintf "0x%x", $id;
+		push @remove, sprintf "0x%x", $id if $mode ne 'fromdb' or $ids_db{$id} or $ids_online{$id};
 		$deleted{$id} = 1;
 		if (-e $file) {
+			print " moving to deleted/";
 			rename $file, "deleted/$md5.jpg" or die "\nCan't move $file to deleted/: $!\n";
 		}
 		$file = "";
@@ -158,10 +213,21 @@ sub process {
 		retrieve($url, $md5, $file) or $file = undef;
 	}
 
+	if ($mode eq 'fromdb') {
+		if (not exists $md5{$md5}) {
+			print "No file for $md5!\n" if $file and not -e $file;
+			$md5{$md5} = 0;
+		} elsif ($md5{$md5}) {
+			$md5{$md5} = 0;
+		} else {
+			warn "Duplicate MD5 in posts table: $md5!\n" and $warn++;
+		}
+	}
+
 	my $rating = $ratings{$_->{rating}};
 	die "$id: Unknown rating `$_->{rating}'\n" unless $rating;
 
-	push @insert,[$id,$_->{rating},$md5,$_->{raw}];
+	push @insert,[$id,$_->{rating},$md5,Compress::Zlib::compress($_->{raw}, 9)] unless $_->{noinsert};
 	my $rows = $sth_chk->execute($id);
 	if ($rows == 1) {
 		my @row = $sth_chk->fetchrow_array or exit 1;
@@ -301,8 +367,29 @@ sub update_db {
 	print "OK.\n";
 }
 
+sub get_ids {
+	print "Retrieving DB ids... ";
+	open my $iqdb, "-|", "$ENV{HOME}/bin/iqdb", "list", $db_file or die "Can't run iqdb: $!\n";
+	while (<$iqdb>) {
+		chomp;
+		$ids_db{hex $_} = 1;
+	}
+	print scalar keys %ids_db, " ids.\n";
+	return if $no_online;
+
+	print "Retrieving online ids... ";
+	open my $nc, "-|", "echo -e 'list $dbid\\ndone now\\n'|nc localhost 5566" or die "Can't start nc: $!\n";
+	while (<$nc>) {
+		chomp;
+		/^000 / and next;
+		/^100 ([0-9a-f]+)$/ or print "Unknown response: $_\n" and next;
+		$ids_online{hex $1} = 1;
+	}
+	print scalar keys %ids_online, " ids.\n";
+}
+
 package MyUserAgent;
-use base qw(LWP::UserAgent XML::Simple Compress::Zlib);
+use base qw(LWP::UserAgent XML::Simple);
 sub prepare_request {
 	my $self = shift;
 	my $req = $self->SUPER::prepare_request(shift);
@@ -326,25 +413,27 @@ sub get_posts {
 	my $decoded = $res->decoded_content();
 	die "Could not decode content: $@\nURL was: $url\nUndecoded length is ".length $res->content,"\n" unless $decoded;
 
-	my $posts = parse($decoded);
+	my $line;
+	while (1) {
+		my @lines = split /\n+/, $decoded;
+		$line = shift @lines; $line = "No XML header: $line" and last unless $line =~ /^<\?xml/;
+		$line = shift @lines; $line = "No posts root tag: $line" and last unless $line =~ /^<posts/;
+		return parse(@lines);
+	}
 
-	return $posts if ref $posts eq 'ARRAY';
 	open my $dump, ">", "/usr/src/packages/sim/last.xml";
 	print $dump $decoded;
 	close $dump;
-	die "XML parsing failed: $posts\n";
+	die "XML parsing failed: $line\n";
 }
 
 sub parse {
-	my @lines = split /\n+/, $_[0];
-	my $line = shift @lines; return "No XML header: $line" unless $line =~ /^<\?xml/;
-	$line = shift @lines; return "No posts root tag: $line" unless $line =~ /^<posts/;
 	my @posts;
-	for (@lines) {
+	for (@_) {
 		next if /^\s*$/ or m#^\s*</posts#;
 		my $post = eval { XML::Simple::XMLin($_) };
 		return "$_: $@" if $@;
-		$post->{raw} = Compress::Zlib::compress($_, 9);
+		$post->{raw} = $_;
 		push @posts, $post;
 	}
 	return \@posts;

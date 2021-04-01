@@ -1,6 +1,10 @@
 # Some configuration options
 #----------------------------
 
+# Graphics library to use, can be GD or ImageMagick.
+IMG_LIB=GD
+#IMG_LIB=ImageMagick
+
 # In simple mode, by default all data needed for queries is now
 # read into memory, using in total about 500 bytes per image. It
 # is possible to select a disk cache using mmap for this instead.
@@ -19,9 +23,16 @@ DEFS+=-DNO_SUPPORT_OLD_VER
 # method of storing the image index internally (in simple mode).
 DEFS+=-DUSE_DELTA_QUEUE
 
+# Disable use of std::tr1::unordered_map if your compiler/C++ library
+# is old and doesn't have it. This will make many things slower.
+# DEFS+=-DNO_TR1
+
 # This may help or hurt performance. Try it and see for yourself.
 DEFS+=-fomit-frame-pointer
 
+# -------------------------
+#  no configuration below
+# -------------------------
 
 .SUFFIXES:
 
@@ -40,18 +51,40 @@ haar.le.o :
 
 .ALWAYS:
 
-% : %.o haar.o imgdb.o # bloom_filter.o
-	g++ -o $@ $^ ${CFLAGS} ${LDFLAGS} -g `pkg-config --libs ImageMagick` ${DEFS}
+ifeq (${IMG_LIB},GD)
+IMG_libs = $(shell gdlib-config --ldflags; gdlib-config --libs)
+IMG_flags = $(shell gdlib-config --cflags)
+IMG_objs = resizer.o
+DEFS+=-DLIB_GD
+else
+ifeq (${IMG_LIB}, ImageMagick)
+IMG_libs = $(shell pkg-config --libs ImageMagick)
+IMG_flags = $(shell pkg-config --cflags ImageMagick)
+IMG_objs =
+DEFS+=-DLIB_ImageMagick
+else
+$(error Unsupported image library '${IMG_LIB}' selected.)
+endif
+endif
 
-%.le : %.le.o haar.le.o imgdb.le.o # bloom_filter.le.o
-	g++ -o $@ $^ ${CFLAGS} ${LDFLAGS} -g `pkg-config --libs ImageMagick` ${DEFS}
+% : %.o haar.o imgdb.o ${IMG_objs} # bloom_filter.o
+	g++ -o $@ $^ ${CFLAGS} ${LDFLAGS} ${IMG_libs} ${DEFS} ${EXTRADEFS}
+
+%.le : %.le.o haar.le.o imgdb.le.o ${IMG_objs} # bloom_filter.le.o
+	g++ -o $@ $^ ${CFLAGS} ${LDFLAGS} ${IMG_libs} ${DEFS} ${EXTRADEFS}
+
+dler : dler.o resizer.o
+	g++ -o $@ $^ ${CFLAGS} ${LDFLAGS} -g -levent -lcurl -lgd ${DEFS} ${EXTRADEFS}
+
+test-resizer : test-resizer.o resizer.o
+	g++ -o $@ $^ ${CFLAGS} ${LDFLAGS} -g -lgd -ljpeg -lpng ${DEFS} ${EXTRADEFS} `gdlib-config --ldflags`
 
 %.o : %.cpp
-	g++ -c -o $@ $< -O2 -fpeel-loops ${CFLAGS} -DNDEBUG -Wall -DLinuxBuild -DImMagick -g `pkg-config --cflags ImageMagick` ${DEFS}
+	g++ -c -o $@ $< -O2 -fpeel-loops ${CFLAGS} -DNDEBUG -Wall -DLinuxBuild -g ${IMG_flags} ${DEFS} ${EXTRADEFS}
 
 %.le.o : %.cpp
-	g++ -c -o $@ $< -O2 -fpeel-loops ${CFLAGS} -DCONV_LE -DNDEBUG -Wall -DLinuxBuild -DImMagick -g `pkg-config --cflags ImageMagick` ${DEFS}
+	g++ -c -o $@ $< -O2 -fpeel-loops ${CFLAGS} -DCONV_LE -DNDEBUG -Wall -DLinuxBuild -g ${IMG_flags} ${DEFS} ${EXTRADEFS}
 
 %.S:	.ALWAYS
-	g++ -S -o $@ $*.cpp -O2 -fpeel-loops ${CFLAGS} -DNDEBUG -Wall -DLinuxBuild -DImMagick -g `pkg-config --cflags ImageMagick` ${DEFS}
+	g++ -S -o $@ $*.cpp -O2 -fpeel-loops ${CFLAGS} -DNDEBUG -Wall -DLinuxBuild -g ${IMG_flags} ${DEFS} ${EXTRADEFS}
 

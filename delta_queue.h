@@ -1,3 +1,6 @@
+#ifndef DELTA_QUEUE_H
+#define DELTA_QUEUE_H
+
 /***************************************************************************\
     Variant of std::vector<size_t> that efficiently stores small differences.
 
@@ -22,7 +25,7 @@
 
 static const size_t size_t_mask = sizeof(size_t) - 1;
 
-union delta_value {
+struct delta_value {
 	delta_value() { }
 	delta_value(size_t v) : full(v) { }
 
@@ -34,15 +37,18 @@ union delta_value {
 
 struct delta_iterator : public std::iterator<std::forward_iterator_tag, size_t> {
 	delta_iterator(const delta_value* itr) : m_p(ptr(itr)), m_val(*itr), m_bval(0) { ++*this; }
-	delta_iterator(const delta_value* itr, int ind) : m_p(ptr(itr) + ind + 1 - sizeof(size_t)) { }	// only useful for end()
 	delta_iterator() { }
 
 	delta_iterator& operator++();
+	delta_iterator  operator++(int) { delta_iterator old = *this; ++*this; return old; }
 	size_t operator*() const { return m_bval; }
 	bool operator==(const delta_iterator& other) const { return m_p == other.m_p; }
 	bool operator!=(const delta_iterator& other) const { return m_p != other.m_p; }
 
 private:
+	friend class delta_queue;
+	delta_iterator(const delta_value* itr, int ind) : m_p(ptr(itr) + ind + 1 - sizeof(size_t)) { }	// only useful for end()
+
 	size_t itr() const { return *(const size_t*)(m_p & ~size_t_mask); }
 	size_t ind() const { return m_p & size_t_mask; }
 
@@ -63,10 +69,10 @@ public:
 	typedef delta_iterator iterator;
 	typedef delta_iterator const_iterator;
 
-	delta_queue() : m_base(1, 0), m_size(0), m_pos(0), m_bval(0) { if (sizeof(size_t) != sizeof(char*)) throw 42; }
+	delta_queue() : m_base(2, 0), m_size(0), m_pos(0), m_bval(0) { if (sizeof(size_t) != sizeof(char*)) throw 42; }
 
 	const_iterator begin() const { return const_iterator(&*m_base.begin()); }
-	const_iterator end() const { return const_iterator(&*m_base.end(), m_size & mask); }
+	const_iterator end() const { return const_iterator(&*(m_base.end() - 1), m_size & mask); }
 
 	// Reserve storage under the assumption most values will be <255 and fit in one byte.
 	// Set fixed=true if you know the exact storage size required, then the size argument
@@ -117,7 +123,8 @@ inline void delta_queue::push_back(size_t v) {
 	m_bval += v;
 
 	if (v >= 255) {
-		m_base.push_back(v - 255);
+		m_base.back() = v - 255;
+		m_base.push_back(0);
 		v = 255;
 	}
 
@@ -126,9 +133,10 @@ inline void delta_queue::push_back(size_t v) {
 //fprintf(stderr, "Now size=%zd. ", m_size);
 
 	if (!(m_size & mask)) {
-		m_pos = m_base.size();
+		m_pos = m_base.size() - 1;
 		m_base.push_back(0);
 //fprintf(stderr, "Now pos=%zd. ", m_pos);
 	};
 }
 
+#endif // DELTA_QUEUE_H

@@ -1,3 +1,15 @@
+iqdb-20080718:
+- support GD for image loading and resizing
+  (it's the default now, edit the Makefile if you prefer ImageMagick)
+- special code for efficiently resizing high-res JPEG and PNG images
+  if using GD
+- fixed dupe finder, call iqdb find_duplicated <dbfile> [<std.dev threshold>]
+- added mkdup script to maintain filename and iqdb database and
+  generate lists of files with duplicate images
+- allow using custom routines for microtime_float, thumb_fname, make_thumb
+  and request_srv in the PHP code, if you need to do things a little, but
+  not completely, differently
+
 iqdb-20080612:
 - optimized delta_iterator to improve query speed by ~20%
   (now as fast or even slightly faster than before)

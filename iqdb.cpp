@@ -36,8 +36,14 @@
 #include <mcheck.h>
 #endif
 
+#include <list>
+
 #include "auto_clean.h"
+#define DEBUG_IQDB
+#include "debug.h"
 #include "imgdb.h"
+
+int debug_level = DEBUG_errors | DEBUG_base | DEBUG_summary; // | DEBUG_dupe_finder; // | DEBUG_resizer;
 
 static void die(const char fmt[], ...) __attribute__ ((format (printf, 1, 2))) __attribute__ ((noreturn));
 static void die(const char fmt[], ...) {
@@ -53,7 +59,7 @@ static void die(const char fmt[], ...) {
 
 imgdb::dbSpace* loaddb(const char* fn, int mode) {
 	imgdb::dbSpace* db = imgdb::dbSpace::load_file(fn, mode);
-	fprintf(stderr, "Database loaded from %s, has %zd images.\n", fn, db->getImgCount());
+	DEBUG(summary)("Database loaded from %s, has %zd images.\n", fn, db->getImgCount());
 	return db;
 }
 
@@ -103,47 +109,135 @@ imgdb::Score min_sim(const imgdb::sim_vector& sim, imgdb::Score min_stddev, imgd
 	return -1;
 }
 
-class dupe_list : private std::vector<imgdb::sim_vector> {
+typedef std::list<imgdb::imageId> dupe_list;
+
+struct dupe_result {
+	dupe_result(imgdb::imageId id_) : id(id_), score(0) { }
+
+	imgdb::imageId id;
+	imgdb::Score score;
+
+	bool operator< (const dupe_result& other) const { return score < other.score; }
+
+};
+
+class dupe_map : public imgdb::imageIdMap<dupe_list*> {
 public:
-	typedef std::vector<imgdb::sim_vector> base_type;
-	using base_type::at;
-	using base_type::size;
+	typedef imgdb::imageId imageId;
 
-	typedef std::map<imgdb::imageId,size_t> dupe_map;
-	typedef dupe_map::iterator dupe_set;
+	typedef imgdb::imageIdMap<dupe_list*> base_type;
+	typedef std::list<dupe_list> group_list;
 
-	dupe_set not_found() { return m_map.end(); }
-	dupe_set find(imgdb::imageId id) { return m_map.find(id); }
-	dupe_set create_set(imgdb::imageId id) {
-		push_back(base_type::value_type());
-		return m_map.insert(dupe_map::value_type(id, size() - 1)).first;
-	}
-	void merge(size_t set, imgdb::sim_vector& from) {
-		for (imgdb::sim_vector::iterator itr = from.begin(); itr != from.end(); ++itr)
-			m_map[itr->id] = set;
+	void link(imageId one, imageId two);
 
-		imgdb::sim_vector& list = at(set);
-		list.insert(list.end(), from.begin(), from.end());
-		from.clear();
-	}
-	void print(FILE *f) {
-		for (iterator itr = begin(); itr != end(); ++itr) {
-			if (itr->empty()) continue;
-			for (imgdb::sim_vector::iterator sItr = itr->begin(); sItr != itr->end(); ++sItr)
-				fprintf(f, "%s%08lx", sItr == itr->begin() ? "" : " ", sItr->id);
-			fprintf(f, "\n");
-		}
-	}
+	group_list::const_iterator group_begin() const { return m_groups.begin(); }
+	group_list::const_iterator group_end() const   { return m_groups.end(); }
 
 private:
-	dupe_map m_map;
+	iterator insert(imageId one, dupe_list* group);
+
+	group_list m_groups;
 };
 
-struct id_not_below : public std::unary_function<imgdb::sim_value,bool> {
-	id_not_below(imgdb::imageId base) : m_base(base) { }
-	bool operator() (const imgdb::sim_value& sim) { return sim.id >= m_base; }
-	imgdb::imageId m_base;
-};
+inline dupe_map::iterator dupe_map::insert(imageId one, dupe_list* group) {
+	group->push_back(one);
+	return base_type::insert(std::make_pair(one, group)).first;
+}
+
+void dupe_map::link(imageId one, imageId two) {
+	if (one == two) return;
+///	if (one > two) std::swap(one, two);
+
+	DEBUG(dupe_finder)("\nLinking %08lx -> %08lx: ", one, two);
+	iterator itrOne = find(one);
+	iterator itrTwo = find(two);
+	if (itrOne == end()) {
+		std::swap(one, two);
+		std::swap(itrOne, itrTwo);
+	}
+	if (itrOne == end()) {
+		dupe_list* group = &*m_groups.insert(m_groups.end(), dupe_list());
+		DEBUG_CONT(dupe_finder)(DEBUG_OUT, "neither ID found, making new group %p.\n", group);
+		insert(one, group);
+		insert(two, group);
+		return;
+
+/*
+	} else if (itrOne == end()) {
+		if (one < *itrTwo->second.pparent) {
+			DEBUG_CONT(dupe_finder)(DEBUG_OUT, "making %08lx new parent of %08lx.\n", one, two);
+			insert(one, *itrTwo->second.pparent, itrTwo->second.pparent);
+			*itrTwo->second.pparent = one;
+			return;
+		}
+		DEBUG_CONT(dupe_finder)(DEBUG_OUT, "inserting in group %08lx of %08lx.\n", *itrTwo->second.pparent, two);
+		dupe_entry& parent = at(*itrTwo->second.pparent);
+		insert(one, parent.next, itrTwo->second.pparent);
+		parent.next = one;
+		return;
+*/
+
+	} else if (itrTwo == end()) {
+		DEBUG_CONT(dupe_finder)(DEBUG_OUT, "inserting in group %p of %08lx.\n", itrOne->second, one);
+		if (itrOne->second->empty()) throw imgdb::internal_error("Group is empty!");
+		insert(two, itrOne->second);
+		return;
+
+	} else if (itrOne->second == itrTwo->second) {
+		DEBUG_CONT(dupe_finder)(DEBUG_OUT, "already grouped in %p.\n", itrOne->second);
+		if (itrOne->second->empty()) throw imgdb::internal_error("Group is empty!");
+		return;
+	}
+
+	// Both exist in different groups. Merge groups.
+	dupe_list* gfrom = itrTwo->second;
+	dupe_list* gto = itrOne->second;
+	DEBUG_CONT(dupe_finder)(DEBUG_OUT, "merging group %p of %08lx into %p of %08lx...", gfrom, two, gto, one);
+	if (gfrom->empty() || gto->empty()) throw imgdb::internal_error("Group is empty!");
+
+	for (dupe_list::iterator lItr = gfrom->begin(); lItr != gfrom->end(); ++lItr) {
+		iterator itr = find(*lItr);
+		DEBUG_CONT(dupe_finder)(DEBUG_OUT, " %08lx(%p->%p)", *lItr, itr == end() ? NULL : itr->second, gto);
+		if (itr == end()) throw imgdb::internal_error("Dupe link not found!");
+		itr->second = gto;
+	}
+
+	gto->splice(gto->end(), *gfrom);
+	if (!gfrom->empty() || gto->empty()) throw imgdb::internal_error("Wrong group is empty!");
+/*
+	dupe_list* group = itrOne->second.pparent;
+	iterator mergeItr = find(*itrTwo->second.pparent);
+	if (mergeItr == end()) throw imgdb::internal_error("Can't find parent to be merged.");
+	if ((itrOne = find(*itrOne->second.pparent)) == end()) throw imgdb::internal_error("Parent not found!");
+	if (itrOne->second.pparent < itrTwo->second.pparent) {
+		DEBUG_CONT(dupe_finder)(DEBUG_OUT, "merging group %08lx of %08lx into %08lx of %08lx...",
+						*itrOne->second.pparent, one, *itrTwo->second.pparent, two);
+		pparent = itrOne->second.pparent;
+		mergeItr = find(*itrTwo->second.pparent);
+	} else {
+		DEBUG_CONT(dupe_finder)(DEBUG_OUT, "merging group %08lx of %08lx into %08lx of %08lx...",
+						*itrTwo->second.pparent, two, *itrOne->second.pparent, one);
+		pparent = itrTwo->second.pparent;
+		mergeItr = find(*itrOne->second.pparent);
+	}
+	parent_list::iterator pItr = std::find_if(m_parents.begin(), m_parents.end(), std::bind2nd(std::equal_to<imageId>(), mergeItr->first));
+	if (pItr == m_parents.end()) throw imgdb::internal_error("Can't find parent to be merged in list.");
+	DEBUG_CONT(dupe_finder)(DEBUG_OUT, " erasing group %p=%08lx", &*pItr, *pItr);
+	m_parents.erase(pItr);
+
+	DEBUG_CONT(dupe_finder)(DEBUG_OUT, " %08lx(%p->%p)", mergeItr->first, mergeItr->second.pparent, pparent);
+	mergeItr->second.pparent = pparent;
+	while (mergeItr->second.next != none) {
+		mergeItr = find(mergeItr->second.next);
+		if (mergeItr == end()) break;
+		DEBUG_CONT(dupe_finder)(DEBUG_OUT, " %08lx(%p->%p)", mergeItr->first, mergeItr->second.pparent, pparent);
+		mergeItr->second.pparent = pparent;
+	}
+
+	mergeItr->second.next = itrOne->second.next;
+	itrOne->second.next = mergeItr->first;
+*/
+}
 
 void find_duplicates(const char* fn, int mindev) {
 	/* for testing stddev code...
@@ -157,15 +251,13 @@ fprintf(stderr, "Min score: %.1f\n", ScD(m));
 	*/
 	dbSpaceAuto db(fn, imgdb::dbSpace::mode_readonly);
 
-	dupe_list dupes;
+	dupe_map dupes;
 
+	fprintf(stderr, "Finding std.dev=%d dupes from %zd images.\n", mindev, db->getImgCount());
 	imgdb::imageId_list images = db->getImgIdList();
 	for (imgdb::imageId_list::const_iterator itr = images.begin(); itr != images.end(); ++itr) {
 		fprintf(stderr, "%3zd%%\r", 100*(itr - images.begin())/images.size());
-		imgdb::sim_vector sim = db->queryImg(imgdb::queryArg(db.ptr(), *itr, 16, imgdb::dbSpace::flag_onlyabove | imgdb::dbSpace::flag_nocommon));
-
-		// This is not needed when imgdb::dbSpace::flag_onlyabove starts working:
-		sim.erase(std::partition(sim.begin(), sim.end(), id_not_below(*itr)), sim.end());
+		imgdb::sim_vector sim = db->queryImg(imgdb::queryArg(db, *itr, 16, 0)); // imgdb::dbSpace::flag_nocommon));
 
 		imgdb::Score min = min_sim(sim, mindev << imgdb::ScoreScale, imgdb::ScoreMax / 2);
 //fprintf(stderr, "%08lx got %4.1f +/- %4.1f: ", *itr, (double)avg/imgdb::ScoreMax, (double)stddev/imgdb::ScoreMax);
@@ -173,41 +265,60 @@ fprintf(stderr, "Min score: %.1f\n", ScD(m));
 //fprintf(stderr, "\n");
 		if (min < 0) continue;
 
-		dupe_list::dupe_set set = dupes.not_found();
-		for (imgdb::sim_vector::iterator sItr = sim.begin(); sItr != sim.end(); ++sItr) {
-			if (sItr->score < min) {
-				sim.erase(sItr, sim.end());
-				break;
-			}
-
-			dupe_list::dupe_set itr = dupes.find(sItr->id);
-			if (itr == dupes.not_found()) continue;
-			if (set == dupes.not_found()) {
-//fprintf(stderr," ID %08lx joining set %08lx:%zd.\n", sItr->id, itr->first, itr->second);
-				set = itr;
-				continue;
-			}
-			if (itr->second == set->second) continue;
-
-			// Two IDs from this dupe set are already in two different sets. Merge second set to first.
-//fprintf(stderr, "ID %08lx already in set %08lx:%zd and also have %08lx:%zd. Merging. ", sItr->id, itr->first, itr->second, set->first, set->second);
-			dupes.merge(set->second, dupes.at(itr->second));
-//fprintf(stderr, "Now %zd has %zd, and %zd has %zd.\n", set->second, dupes.at(set->second).size(), itr->second, dupes.at(itr->second).size());
-		}
-
-		if (set == dupes.not_found()) {
-			set = dupes.create_set(sim[0].id);
-//fprintf(stderr, "ID %08lx creating new set %08lx:%zd.\n", sim[0].id, set->first, set->second);
-		}
-
-		dupes.merge(set->second, sim);
-//		fprintf(stderr, "Set %zd now: ", set->second);
-//		for (imgdb::sim_vector::const_iterator itr = dupes.at(set->second).begin(); itr != dupes.at(set->second).end(); ++itr)
-//			fprintf(stderr, " %08lx:%.1f", itr->id, ScD(itr->score));
-//		fprintf(stderr, "\n");
+		for (imgdb::sim_vector::iterator sItr = sim.begin(); sItr != sim.end() && sItr->score >= min; ++sItr)
+			dupes.link(*itr, sItr->id);
 	}
 
-	dupes.print(stdout);
+	for (dupe_map::group_list::const_iterator itr = dupes.group_begin(); itr != dupes.group_end(); ++itr) {
+		if (itr->empty()) {
+			DEBUG(dupe_finder)("Skipping empty group %p.\n", &*itr);
+			continue;
+		}
+
+		typedef std::vector<dupe_result> out_list;
+		out_list out;
+		DEBUG(dupe_finder)("Processing group %p: ", &*itr);
+		for (dupe_list::const_iterator dItr = itr->begin(); dItr != itr->end(); ++dItr) {
+			DEBUG(dupe_finder)(" %08lx", *dItr);
+			out.push_back(*dItr);
+			dupe_map::iterator mItr = dupes.find(*dItr);
+			if (mItr == dupes.end()) throw imgdb::internal_error("Could not find linked dupe.");
+			if (mItr->second != &*itr) throw imgdb::internal_error("Linked dupe has wrong group!");
+			dupes.erase(mItr);
+		}
+		//fprintf(stderr, "\nGetting scores:");
+		for (out_list::iterator one = out.begin(); one != out.end(); ++one)
+			for (out_list::iterator two = one + 1; two != out.end(); ++two) {
+				//fprintf(stderr, " %08lx<->%08lx:", one->id, two->id);
+				imgdb::Score score = db->calcSim(one->id, two->id, false);
+				//fprintf(stderr, "%.1f", ScD(score));
+				one->score += score;
+				two->score += score;
+		}
+		std::make_heap(out.begin(), out.end());
+		imgdb::imageId ref = out.front().id;
+		std::pop_heap(out.begin(), out.end());
+		out.pop_back();
+		//fprintf(stderr, "\nReference: %08lx", ref);
+		for (out_list::iterator one = out.begin(); one != out.end(); ++one) {
+			imgdb::Score score = db->calcSim(one->id, ref, false);
+			//fprintf(stderr, " %08lx<->%08lx:%.1f", one->id, ref, ScD(score));
+			one->score = score;
+		}
+		std::make_heap(out.begin(), out.end());
+		//fprintf(stderr, "\nPrinting: %08lx", ref);
+		printf("202 %08lx=%.1f", ref, 0.0);
+		while (!out.empty()) {
+			imgdb::Score score = db->calcSim(out.front().id, ref, false);
+			//fprintf(stderr, " %08lx<->%08lx:%.1f", out.front().id, ref, ScD(score));
+			printf(" %08lx:%.1f",out.front().id, ScD(score));
+			std::pop_heap(out.begin(), out.end());
+			out.pop_back();
+		}
+		printf("\n");
+	}
+
+	if (!dupes.empty()) throw imgdb::internal_error("Orphaned dupe!");
 }
 
 void add(const char* fn) {
@@ -281,7 +392,7 @@ void diff(const char* fn, imgdb::imageId id1, imgdb::imageId id2) {
 
 void sim(const char* fn, imgdb::imageId id, int numres) {
 	dbSpaceAuto db(fn, imgdb::dbSpace::mode_readonly);
-	imgdb::sim_vector sim = db->queryImg(imgdb::queryArg(db.ptr(), id, numres, 0));
+	imgdb::sim_vector sim = db->queryImg(imgdb::queryArg(db, id, numres, 0));
 	for (size_t i = 0; i < sim.size(); i++)
 		printf("%08lx %lf %d %d\n", sim[i].id, (double)sim[i].score / imgdb::ScoreMax, sim[i].width, sim[i].height);
 }
@@ -392,7 +503,7 @@ void do_commands(FILE* rd, FILE* wr, dbSpaceAutoList dbs, int ndbs) {
 			char* eol = strchr(arg, '\n'); if (eol) *eol = 0;
 
 			imgdb::ImgData img;
-			imgdb::dbSpace::imgDataFromFile(arg, &img);
+			imgdb::dbSpace::imgDataFromFile(arg, 0, &img);
 			queryOpt.reset();
 
 			std::vector<sim_db_value> sim;
@@ -659,8 +770,8 @@ void server(const char* hostport, int numfiles, char** files) {
 		} catch (const event_t& event) {
 			if (event == DO_QUITANDSAVE) return;
 
-		// Unhandled imgdb::generic_error means it was fatal or completely unknown.
-		} catch (const imgdb::generic_error& err) {
+		// Unhandled imgdb::base_error means it was fatal or completely unknown.
+		} catch (const imgdb::base_error& err) {
 			fprintf(stream.wr, "302 %s %s\n", err.type(), err.what());
 			throw;
 
@@ -715,7 +826,7 @@ int main(int argc, char** argv) {
 	} else if (!strcasecmp(argv[1], "rehash")) {
 		rehash(filename);
 	} else if (!strcasecmp(argv[1], "find_duplicates")) {
-		int mindev = strtol(argv[3], NULL, 0);
+		int mindev = argc < 4 ? 10 : strtol(argv[3], NULL, 0);
 		if (mindev < 1 || mindev > 99) mindev = 10;
 		find_duplicates(filename, mindev);
 	} else if (!strcasecmp(argv[1], "command")) {
@@ -738,7 +849,7 @@ int main(int argc, char** argv) {
 	fprintf(stderr, "Data error: %s.\n", err.what());
 	exit(10);
 
-  } catch (const imgdb::generic_error& err) {
+  } catch (const imgdb::base_error& err) {
 	fprintf(stderr, "Caught error %s: %s.\n", err.type(), err.what());
 	if (errno) perror("Last system error");
   }
